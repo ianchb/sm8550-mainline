@@ -10,6 +10,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/regmap.h>
 
@@ -48,6 +49,7 @@ struct ktz8866 {
 	struct regmap *regmap;
 	bool led_on;
 	struct gpio_desc *enable_gpio;
+	struct backlight_device *backlight;
 };
 
 static const struct regmap_config ktz8866_regmap_config = {
@@ -56,16 +58,33 @@ static const struct regmap_config ktz8866_regmap_config = {
 	.max_register = REG_MAX,
 };
 
+static DEFINE_MUTEX(ktz8866_pair_lock);
+static struct ktz8866 *ktz_b;
+
 static int ktz8866_write(struct ktz8866 *ktz, unsigned int reg,
 			 unsigned int val)
 {
-	return regmap_write(ktz->regmap, reg, val);
+	regmap_write(ktz->regmap, reg, val);
+
+	mutex_lock(&ktz8866_pair_lock);
+	if (ktz_b)
+		regmap_write(ktz_b->regmap, reg, val);
+	mutex_unlock(&ktz8866_pair_lock);
+
+	return 0;
 }
 
 static int ktz8866_update_bits(struct ktz8866 *ktz, unsigned int reg,
 			       unsigned int mask, unsigned int val)
 {
-	return regmap_update_bits(ktz->regmap, reg, mask, val);
+	regmap_update_bits(ktz->regmap, reg, mask, val);
+
+	mutex_lock(&ktz8866_pair_lock);
+	if (ktz_b)
+		regmap_update_bits(ktz_b->regmap, reg, mask, val);
+	mutex_unlock(&ktz8866_pair_lock);
+
+	return 0;
 }
 
 static int ktz8866_backlight_update_status(struct backlight_device *backlight_dev)
@@ -126,16 +145,25 @@ static void ktz8866_init(struct ktz8866 *ktz)
 
 static int ktz8866_probe(struct i2c_client *client)
 {
-	struct backlight_device *backlight_dev;
+	const struct i2c_device_id *id = i2c_client_get_device_id(client);
 	struct backlight_properties props;
 	struct ktz8866 *ktz;
 	int ret = 0;
+
+	if (id->driver_data == 1) {
+		mutex_lock(&ktz8866_pair_lock);
+		ret = ktz_b ? 0 : -EPROBE_DEFER;
+		mutex_unlock(&ktz8866_pair_lock);
+		if (ret)
+			return ret;
+	}
 
 	ktz = devm_kzalloc(&client->dev, sizeof(*ktz), GFP_KERNEL);
 	if (!ktz)
 		return -ENOMEM;
 
 	ktz->client = client;
+	i2c_set_clientdata(client, ktz);
 	ktz->regmap = devm_regmap_init_i2c(client, &ktz8866_regmap_config);
 	if (IS_ERR(ktz->regmap))
 		return dev_err_probe(&client->dev, PTR_ERR(ktz->regmap), "failed to init regmap\n");
@@ -147,6 +175,13 @@ static int ktz8866_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(&client->dev, ret, "get regulator vddneg failed\n");
 
+	if (id->driver_data == 2) {
+		mutex_lock(&ktz8866_pair_lock);
+		ktz_b = ktz;
+		mutex_unlock(&ktz8866_pair_lock);
+		goto end;
+	}
+
 	ktz->enable_gpio = devm_gpiod_get_optional(&client->dev, "enable", GPIOD_OUT_HIGH);
 	if (IS_ERR(ktz->enable_gpio))
 		return PTR_ERR(ktz->enable_gpio);
@@ -157,37 +192,51 @@ static int ktz8866_probe(struct i2c_client *client)
 	props.brightness = DEFAULT_BRIGHTNESS;
 	props.scale = BACKLIGHT_SCALE_LINEAR;
 
-	backlight_dev = devm_backlight_device_register(&client->dev, "ktz8866-backlight",
-					&client->dev, ktz, &ktz8866_backlight_ops, &props);
-	if (IS_ERR(backlight_dev))
-		return dev_err_probe(&client->dev, PTR_ERR(backlight_dev),
+	ktz->backlight = devm_backlight_device_register(&client->dev,
+						       "ktz8866-backlight",
+						       &client->dev, ktz,
+						       &ktz8866_backlight_ops,
+						       &props);
+	if (IS_ERR(ktz->backlight))
+		return dev_err_probe(&client->dev, PTR_ERR(ktz->backlight),
 				"failed to register backlight device\n");
 
 	ktz8866_init(ktz);
 
-	i2c_set_clientdata(client, backlight_dev);
-	backlight_update_status(backlight_dev);
+	backlight_update_status(ktz->backlight);
 
+end:
 	return 0;
 }
 
 static void ktz8866_remove(struct i2c_client *client)
 {
-	struct backlight_device *backlight_dev = i2c_get_clientdata(client);
-	backlight_dev->props.brightness = 0;
-	backlight_update_status(backlight_dev);
+	struct ktz8866 *ktz = i2c_get_clientdata(client);
+
+	mutex_lock(&ktz8866_pair_lock);
+	if (ktz_b == ktz)
+		ktz_b = NULL;
+	mutex_unlock(&ktz8866_pair_lock);
+
+	if (!ktz->backlight)
+		return;
+
+	ktz->backlight->props.brightness = 0;
+	backlight_update_status(ktz->backlight);
 }
 
 static const struct i2c_device_id ktz8866_ids[] = {
 	{ .name = "ktz8866" },
+	{ .name = "ktz8866a", .driver_data = 1 },
+	{ .name = "ktz8866b", .driver_data = 2 },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, ktz8866_ids);
 
 static const struct of_device_id ktz8866_match_table[] = {
-	{
-		.compatible = "kinetic,ktz8866",
-	},
+	{ .compatible = "kinetic,ktz8866", },
+	{ .compatible = "kinetic,ktz8866a", },
+	{ .compatible = "kinetic,ktz8866b", },
 	{},
 };
 MODULE_DEVICE_TABLE(of, ktz8866_match_table);
