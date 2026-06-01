@@ -5,6 +5,7 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/auxiliary_bus.h>
+#include <linux/hex.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
@@ -14,6 +15,8 @@
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/math.h>
+#include <linux/string.h>
+#include <linux/unaligned.h>
 #include <linux/units.h>
 
 #define BATTMGR_CHEMISTRY_LEN	4
@@ -105,6 +108,45 @@ enum qcom_battmgr_variant {
 #define CHARGE_CTRL_END_THR_MAX		100
 #define CHARGE_CTRL_DELTA_SOC		5
 
+/* Xiaomi vendor battery properties use a separate qti_battery_charger opcode pair. */
+#define BATTMGR_XM_PROPERTY_GET		0x50
+#define BATTMGR_XM_PROPERTY_SET		0x51
+
+/* Xiaomi battery properties used by the vendor qti_battery_charger driver. */
+#define XM_BATT_VERIFY_DIGEST			0x01
+#define XM_BATT_AUTHENTIC			0x03
+#define XM_BATT_REAL_TYPE			0x07
+#define XM_BATT_VERIFY_PROCESS			0x0c
+#define XM_BATT_VDM_CMD_CHARGER_VERSION		0x0d
+#define XM_BATT_VDM_CMD_CHARGER_VOLTAGE		0x0e
+#define XM_BATT_VDM_CMD_CHARGER_TEMP		0x0f
+#define XM_BATT_VDM_CMD_SESSION_SEED		0x10
+#define XM_BATT_VDM_CMD_AUTHENTICATION		0x11
+#define XM_BATT_VDM_CMD_VERIFIED		0x12
+#define XM_BATT_VDM_CMD_REMOVE_COMPENSATION	0x13
+#define XM_BATT_VDM_CMD_REVERSE_AUTHEN		0x14
+#define XM_BATT_ADAPTER_ID			0x16
+#define XM_BATT_ADAPTER_SVID			0x17
+#define XM_BATT_PD_VERIFED			0x18
+#define XM_BATT_PDO2				0x19
+#define XM_BATT_UVDM_STATE			0x1a
+#define XM_BATT_BQ2597X_CHIP_OK		0x1b
+#define XM_BATT_BQ2597X_SLAVE_CHIP_OK		0x1c
+#define XM_BATT_BQ2597X_BUS_CURRENT		0x1d
+#define XM_BATT_BQ2597X_SLAVE_BUS_CURRENT	0x1e
+#define XM_BATT_BQ2597X_BUS_DELTA		0x1f
+#define XM_BATT_BQ2597X_BUS_VOLTAGE		0x20
+#define XM_BATT_BQ2597X_BATTERY_PRESENT		0x21
+#define XM_BATT_BQ2597X_SLAVE_BATTERY_PRESENT	0x22
+#define XM_BATT_BQ2597X_BATTERY_VOLTAGE		0x23
+#define XM_BATT_FASTCHGMODE			0x2b
+#define XM_BATT_QUICK_CHARGE_TYPE		0x31
+#define XM_BATT_APDO_MAX			0x32
+#define XM_BATT_POWER_MAX			0x33
+#define XM_BATT_FG_FAST_CHARGE			0x8f
+#define XM_BATT_SLAVE_AUTHENTIC		0xa5
+#define XM_BATT_PPS_PTF			0xe7
+
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
 	__le32 battery_id;
@@ -118,6 +160,20 @@ struct qcom_battmgr_property_request {
 	__le32 battery;
 	__le32 property;
 	__le32 value;
+};
+
+struct qcom_battmgr_xiaomi_vdm_request {
+	struct pmic_glink_hdr hdr;
+	__le32 property;
+	__le32 data[4];
+};
+
+struct qcom_battmgr_xiaomi_digest_request {
+	struct pmic_glink_hdr hdr;
+	__le32 property;
+	u8 digest[32];
+	u8 slave;
+	u8 reserved[3];
 };
 
 struct qcom_battmgr_update_request {
@@ -332,6 +388,13 @@ struct qcom_battmgr {
 	struct qcom_battmgr_usb usb;
 	struct qcom_battmgr_wireless wireless;
 
+	bool xiaomi_prop_pending;
+	unsigned int xiaomi_prop;
+	u32 xiaomi_prop_value;
+	u8 xiaomi_prop_data[32];
+	size_t xiaomi_prop_data_len;
+	u8 xiaomi_verify_slave;
+
 	struct work_struct enable_work;
 
 	/*
@@ -374,6 +437,119 @@ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcod
 	};
 
 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+}
+
+static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, int opcode,
+						int property, u32 value, u32 *out_value)
+{
+	int ret;
+
+	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
+		return -EOPNOTSUPP;
+
+	if (!battmgr->service_up)
+		return -EAGAIN;
+
+	mutex_lock(&battmgr->lock);
+	battmgr->xiaomi_prop_pending = true;
+	battmgr->xiaomi_prop = property;
+	battmgr->xiaomi_prop_value = 0;
+	battmgr->xiaomi_prop_data_len = 0;
+
+	ret = qcom_battmgr_request_property(battmgr, opcode, property, value);
+	if (!ret && out_value)
+		*out_value = battmgr->xiaomi_prop_value;
+
+	battmgr->xiaomi_prop_pending = false;
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
+}
+
+static int qcom_battmgr_xiaomi_request_vdm(struct qcom_battmgr *battmgr, int opcode,
+					   int property, const __le32 *data,
+					   __le32 *out_data)
+{
+	struct qcom_battmgr_xiaomi_vdm_request request = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(opcode),
+		.property = cpu_to_le32(property),
+	};
+	int ret;
+
+	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
+		return -EOPNOTSUPP;
+
+	if (!battmgr->service_up)
+		return -EAGAIN;
+
+	if (data)
+		memcpy(request.data, data, sizeof(request.data));
+
+	mutex_lock(&battmgr->lock);
+	battmgr->xiaomi_prop_pending = true;
+	battmgr->xiaomi_prop = property;
+	battmgr->xiaomi_prop_value = 0;
+	battmgr->xiaomi_prop_data_len = 0;
+
+	ret = qcom_battmgr_request(battmgr, &request, sizeof(request));
+	if (!ret && out_data) {
+		if (battmgr->xiaomi_prop_data_len < sizeof(request.data)) {
+			ret = -ENODATA;
+		} else {
+			memcpy(out_data, battmgr->xiaomi_prop_data, sizeof(request.data));
+		}
+	}
+
+	battmgr->xiaomi_prop_pending = false;
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
+}
+
+static int qcom_battmgr_xiaomi_request_digest(struct qcom_battmgr *battmgr, int opcode,
+					      const u8 *digest, u8 slave,
+					      u8 *out_digest)
+{
+	struct qcom_battmgr_xiaomi_digest_request request = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(opcode),
+		.property = cpu_to_le32(XM_BATT_VERIFY_DIGEST),
+		.slave = slave,
+	};
+	int ret;
+
+	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
+		return -EOPNOTSUPP;
+
+	if (!battmgr->service_up)
+		return -EAGAIN;
+
+	if (digest)
+		memcpy(request.digest, digest, sizeof(request.digest));
+
+	mutex_lock(&battmgr->lock);
+	battmgr->xiaomi_prop_pending = true;
+	battmgr->xiaomi_prop = XM_BATT_VERIFY_DIGEST;
+	battmgr->xiaomi_prop_value = 0;
+	battmgr->xiaomi_prop_data_len = 0;
+
+	ret = qcom_battmgr_request(battmgr, &request, sizeof(request));
+	if (!ret && out_digest) {
+		if (battmgr->xiaomi_prop_data_len < sizeof(request.digest)) {
+			ret = -ENODATA;
+		} else {
+			memcpy(out_digest, battmgr->xiaomi_prop_data,
+			       sizeof(request.digest));
+		}
+	}
+
+	battmgr->xiaomi_prop_pending = false;
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
 }
 
 static int qcom_battmgr_update_status(struct qcom_battmgr *battmgr)
@@ -793,6 +969,415 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 
 	return 0;
 }
+
+enum qcom_battmgr_xiaomi_attr_format {
+	QCOM_BATTMGR_XIAOMI_DEC,
+	QCOM_BATTMGR_XIAOMI_HEX,
+	QCOM_BATTMGR_XIAOMI_USB_TYPE,
+};
+
+struct qcom_battmgr_xiaomi_attr {
+	struct device_attribute dev_attr;
+	unsigned int prop;
+	enum qcom_battmgr_xiaomi_attr_format format;
+};
+
+static const char *qcom_battmgr_xiaomi_usb_type_string(unsigned int val)
+{
+	switch (val) {
+	case POWER_SUPPLY_USB_TYPE_UNKNOWN:
+		return "Unknown";
+	case POWER_SUPPLY_USB_TYPE_SDP:
+		return "SDP";
+	case POWER_SUPPLY_USB_TYPE_DCP:
+		return "DCP";
+	case POWER_SUPPLY_USB_TYPE_CDP:
+		return "CDP";
+	case POWER_SUPPLY_USB_TYPE_ACA:
+		return "ACA";
+	case POWER_SUPPLY_USB_TYPE_C:
+		return "C";
+	case POWER_SUPPLY_USB_TYPE_PD:
+		return "PD";
+	case POWER_SUPPLY_USB_TYPE_PD_DRP:
+		return "PD_DRP";
+	case POWER_SUPPLY_USB_TYPE_PD_PPS:
+		return "PD_PPS";
+	case POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID:
+		return "BrickID";
+	default:
+		return NULL;
+	}
+}
+
+static ssize_t qcom_battmgr_xiaomi_prop_show(struct device *dev,
+					     struct device_attribute *attr,
+					     char *buf)
+{
+	struct qcom_battmgr_xiaomi_attr *xiaomi_attr =
+		container_of(attr, struct qcom_battmgr_xiaomi_attr, dev_attr);
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	const char *str;
+	u32 val;
+	int ret;
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+						   xiaomi_attr->prop, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	switch (xiaomi_attr->format) {
+	case QCOM_BATTMGR_XIAOMI_HEX:
+		return sysfs_emit(buf, "%08x\n", val);
+	case QCOM_BATTMGR_XIAOMI_USB_TYPE:
+		str = qcom_battmgr_xiaomi_usb_type_string(val);
+		if (str)
+			return sysfs_emit(buf, "%s\n", str);
+
+		return sysfs_emit(buf, "%u\n", val);
+	case QCOM_BATTMGR_XIAOMI_DEC:
+	default:
+		return sysfs_emit(buf, "%u\n", val);
+	}
+}
+
+static ssize_t qcom_battmgr_xiaomi_prop_store(struct device *dev,
+					      struct device_attribute *attr,
+					      const char *buf, size_t count)
+{
+	struct qcom_battmgr_xiaomi_attr *xiaomi_attr =
+		container_of(attr, struct qcom_battmgr_xiaomi_attr, dev_attr);
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	u32 val;
+	int ret;
+
+	ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_SET,
+						   xiaomi_attr->prop, val, NULL);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static int qcom_battmgr_xiaomi_parse_vdm_payload(const char *hex, __le32 data[4])
+{
+	u8 bytes[16];
+	int i, ret;
+
+	if (strlen(hex) != sizeof(bytes) * 2)
+		return -EINVAL;
+
+	ret = hex2bin(bytes, hex, sizeof(bytes));
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 4; i++)
+		data[i] = cpu_to_le32(get_unaligned_be32(&bytes[i * sizeof(__be32)]));
+
+	return 0;
+}
+
+static ssize_t request_vdm_cmd_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	__le32 auth[4];
+	u32 state, val;
+	int ret;
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+						   XM_BATT_UVDM_STATE, 0, &state);
+	if (ret < 0)
+		return ret;
+
+	switch (state) {
+	case 1:
+		ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+							   XM_BATT_VDM_CMD_CHARGER_VERSION,
+							   0, &val);
+		if (ret < 0)
+			return ret;
+		return sysfs_emit(buf, "%u,%u\n", state, val);
+	case 2:
+		ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+							   XM_BATT_VDM_CMD_CHARGER_VOLTAGE,
+							   0, &val);
+		if (ret < 0)
+			return ret;
+		return sysfs_emit(buf, "%u,%u\n", state, val);
+	case 3:
+		ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+							   XM_BATT_VDM_CMD_CHARGER_TEMP,
+							   0, &val);
+		if (ret < 0)
+			return ret;
+		return sysfs_emit(buf, "%u,%u\n", state, val);
+	case 5:
+		ret = qcom_battmgr_xiaomi_request_vdm(battmgr, BATTMGR_XM_PROPERTY_GET,
+						      XM_BATT_VDM_CMD_AUTHENTICATION,
+						      NULL, auth);
+		if (ret < 0)
+			return ret;
+		return sysfs_emit(buf, "%u,%08x%08x%08x%08x\n", state,
+				  le32_to_cpu(auth[0]), le32_to_cpu(auth[1]),
+				  le32_to_cpu(auth[2]), le32_to_cpu(auth[3]));
+	default:
+		return sysfs_emit(buf, "%u,Null\n", state);
+	}
+}
+
+static ssize_t request_vdm_cmd_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	char hex[33] = {};
+	__le32 data[4];
+	unsigned int cmd;
+	u8 bytes[4];
+	u32 val = 0;
+	int prop;
+	int ret;
+
+	ret = sscanf(buf, "%u,%32s", &cmd, hex);
+	if (ret < 1)
+		return -EINVAL;
+
+	switch (cmd) {
+	case 1:
+		prop = XM_BATT_VDM_CMD_CHARGER_VERSION;
+		break;
+	case 2:
+		prop = XM_BATT_VDM_CMD_CHARGER_VOLTAGE;
+		break;
+	case 3:
+		prop = XM_BATT_VDM_CMD_CHARGER_TEMP;
+		break;
+	case 4:
+		prop = XM_BATT_VDM_CMD_SESSION_SEED;
+		goto send_vdm;
+	case 5:
+		prop = XM_BATT_VDM_CMD_AUTHENTICATION;
+		goto send_vdm;
+	case 6:
+		prop = XM_BATT_VDM_CMD_VERIFIED;
+		goto send_value;
+	case 7:
+		prop = XM_BATT_VDM_CMD_REMOVE_COMPENSATION;
+		goto send_value;
+	case 8:
+		prop = XM_BATT_VDM_CMD_REVERSE_AUTHEN;
+		goto send_vdm;
+	default:
+		return -EINVAL;
+	}
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_SET,
+						   prop, 0, NULL);
+	if (ret < 0)
+		return ret;
+
+	return count;
+
+send_value:
+	if (strlen(hex) != sizeof(bytes) * 2)
+		return -EINVAL;
+
+	ret = hex2bin(bytes, hex, sizeof(bytes));
+	if (ret)
+		return ret;
+
+	val = get_unaligned_le32(bytes);
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_SET,
+						   prop, val, NULL);
+	if (ret < 0)
+		return ret;
+
+	return count;
+
+send_vdm:
+	ret = qcom_battmgr_xiaomi_parse_vdm_payload(hex, data);
+	if (ret)
+		return ret;
+
+	ret = qcom_battmgr_xiaomi_request_vdm(battmgr, BATTMGR_XM_PROPERTY_SET,
+					      prop, data, NULL);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(request_vdm_cmd);
+
+static ssize_t verify_slave_flag_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", battmgr->xiaomi_verify_slave);
+}
+
+static ssize_t verify_slave_flag_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	u8 val;
+	int ret;
+
+	ret = kstrtou8(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	battmgr->xiaomi_verify_slave = !!val;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(verify_slave_flag);
+
+static ssize_t verify_digest_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	u8 digest[32];
+	char hex[65];
+	int ret;
+
+	ret = qcom_battmgr_xiaomi_request_digest(battmgr, BATTMGR_XM_PROPERTY_GET,
+						 NULL, battmgr->xiaomi_verify_slave,
+						 digest);
+	if (ret < 0)
+		return ret;
+
+	bin2hex(hex, digest, sizeof(digest));
+	hex[sizeof(hex) - 1] = '\0';
+
+	return sysfs_emit(buf, "%s\n", hex);
+}
+
+static ssize_t verify_digest_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	char hex[65] = {};
+	u8 digest[32];
+	int ret;
+
+	if (sscanf(buf, "%64s", hex) != 1)
+		return -EINVAL;
+
+	if (strlen(hex) != sizeof(digest) * 2)
+		return -EINVAL;
+
+	ret = hex2bin(digest, hex, sizeof(digest));
+	if (ret)
+		return ret;
+
+	ret = qcom_battmgr_xiaomi_request_digest(battmgr, BATTMGR_XM_PROPERTY_SET,
+						 digest, battmgr->xiaomi_verify_slave,
+						 NULL);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(verify_digest);
+
+#define QCOM_BATTMGR_XIAOMI_ATTR_RO(_name, _prop, _format)		\
+	static struct qcom_battmgr_xiaomi_attr qcom_battmgr_xiaomi_attr_##_name = { \
+		.dev_attr = __ATTR(_name, 0444, qcom_battmgr_xiaomi_prop_show, NULL), \
+		.prop = _prop,						\
+		.format = _format,					\
+	}
+
+#define QCOM_BATTMGR_XIAOMI_ATTR_RW(_name, _prop, _format)		\
+	static struct qcom_battmgr_xiaomi_attr qcom_battmgr_xiaomi_attr_##_name = { \
+		.dev_attr = __ATTR(_name, 0644, qcom_battmgr_xiaomi_prop_show, \
+				   qcom_battmgr_xiaomi_prop_store),	\
+		.prop = _prop,						\
+		.format = _format,					\
+	}
+
+#define QCOM_BATTMGR_XIAOMI_ATTR_WO(_name, _prop, _format)		\
+	static struct qcom_battmgr_xiaomi_attr qcom_battmgr_xiaomi_attr_##_name = { \
+		.dev_attr = __ATTR(_name, 0200, NULL, qcom_battmgr_xiaomi_prop_store), \
+		.prop = _prop,						\
+		.format = _format,					\
+	}
+
+QCOM_BATTMGR_XIAOMI_ATTR_RO(real_type, XM_BATT_REAL_TYPE, QCOM_BATTMGR_XIAOMI_USB_TYPE);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(authentic, XM_BATT_AUTHENTIC, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(slave_authentic, XM_BATT_SLAVE_AUTHENTIC, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(verify_process, XM_BATT_VERIFY_PROCESS, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(quick_charge_type, XM_BATT_QUICK_CHARGE_TYPE, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(fastchg_mode, XM_BATT_FASTCHGMODE, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(pd_verifed, XM_BATT_PD_VERIFED, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(pps_ptf, XM_BATT_PPS_PTF, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_WO(fg_fastcharge, XM_BATT_FG_FAST_CHARGE, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(apdo_max, XM_BATT_APDO_MAX, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(power_max, XM_BATT_POWER_MAX, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pdo2, XM_BATT_PDO2, QCOM_BATTMGR_XIAOMI_HEX);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(adapter_svid, XM_BATT_ADAPTER_SVID, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(adapter_id, XM_BATT_ADAPTER_ID, QCOM_BATTMGR_XIAOMI_HEX);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_chip_ok, XM_BATT_BQ2597X_CHIP_OK, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_slave_chip_ok, XM_BATT_BQ2597X_SLAVE_CHIP_OK,
+			    QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_bus_current, XM_BATT_BQ2597X_BUS_CURRENT,
+			    QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_slave_bus_current, XM_BATT_BQ2597X_SLAVE_BUS_CURRENT,
+			    QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_bus_delta, XM_BATT_BQ2597X_BUS_DELTA, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_bus_voltage, XM_BATT_BQ2597X_BUS_VOLTAGE,
+			    QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_battery_present, XM_BATT_BQ2597X_BATTERY_PRESENT,
+			    QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_slave_battery_present, XM_BATT_BQ2597X_SLAVE_BATTERY_PRESENT,
+			    QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_battery_voltage, XM_BATT_BQ2597X_BATTERY_VOLTAGE,
+			    QCOM_BATTMGR_XIAOMI_DEC);
+
+static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+	&qcom_battmgr_xiaomi_attr_real_type.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_authentic.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_slave_authentic.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_verify_process.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_quick_charge_type.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_fastchg_mode.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pd_verifed.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pps_ptf.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_fg_fastcharge.dev_attr.attr,
+	&dev_attr_request_vdm_cmd.attr,
+	&dev_attr_verify_slave_flag.attr,
+	&dev_attr_verify_digest.attr,
+	&qcom_battmgr_xiaomi_attr_apdo_max.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_power_max.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pdo2.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_adapter_svid.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_adapter_id.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_chip_ok.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_slave_chip_ok.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_bus_current.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_slave_bus_current.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_bus_delta.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_bus_voltage.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_battery_present.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_slave_battery_present.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_battery_voltage.dev_attr.attr,
+	NULL
+};
+
+static const struct attribute_group qcom_battmgr_xiaomi_attr_group = {
+	.name = "xiaomi",
+	.attrs = qcom_battmgr_xiaomi_attrs,
+};
 
 static const enum power_supply_property sc8280xp_bat_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
@@ -1383,14 +1968,64 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 	}
 
 	switch (opcode) {
+	case BATTMGR_XM_PROPERTY_SET:
+	case BATTMGR_XM_PROPERTY_GET:
+		property = le32_to_cpu(resp->intval.property);
+		if (battmgr->variant != XIAOMI_BATTMGR_SM8550) {
+			dev_warn(battmgr->dev, "unexpected Xiaomi property response\n");
+			break;
+		}
+
+		if (!battmgr->xiaomi_prop_pending || property != battmgr->xiaomi_prop) {
+			dev_dbg(battmgr->dev, "unsolicited Xiaomi property %#x response\n", property);
+			return;
+		}
+
+		if (payload_len == sizeof(resp->intval)) {
+			battmgr->error = le32_to_cpu(resp->intval.result);
+			if (!battmgr->error)
+				battmgr->xiaomi_prop_value = le32_to_cpu(resp->intval.value);
+			break;
+		}
+
+		if (payload_len > sizeof(resp->intval.property)) {
+			size_t data_len = min_t(size_t,
+						payload_len - sizeof(resp->intval.property),
+						sizeof(battmgr->xiaomi_prop_data));
+
+			battmgr->error = 0;
+			battmgr->xiaomi_prop_value = le32_to_cpu(resp->intval.value);
+			memcpy(battmgr->xiaomi_prop_data, &resp->intval.value,
+			       data_len);
+			battmgr->xiaomi_prop_data_len = data_len;
+			if (property == XM_BATT_VERIFY_DIGEST)
+				dev_dbg(battmgr->dev,
+					"verify digest response opcode=%#x len=%zu data=%*phN\n",
+					opcode, payload_len, (int)data_len,
+					battmgr->xiaomi_prop_data);
+			break;
+		}
+
+		dev_warn(battmgr->dev,
+			 "invalid payload length for Xiaomi property %#x request: %zd\n",
+			 property, payload_len);
+		battmgr->error = -ENODATA;
+		break;
+	case BATTMGR_BAT_PROPERTY_SET:
 	case BATTMGR_BAT_PROPERTY_GET:
 		property = le32_to_cpu(resp->intval.property);
+		if (opcode == BATTMGR_BAT_PROPERTY_SET) {
+			if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
+				dev_warn(battmgr->dev, "unexpected battery property set response\n");
+			break;
+		}
+
 		if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
 			/* Xiaomi added BATT_CONSTANT_CURRENT after BATT_CHG_CTRL_LIM_MAX according
 			 * to their code, but it also seems that two properties got removed?
 			 * Fix properties after BATT_CHG_CTRL_LIM_MAX by decreasing property by 1
 			 */
-			if(property > BATT_CHG_CTRL_LIM_MAX)
+			if (property > BATT_CHG_CTRL_LIM_MAX)
 				property--;
 		}
 		if (property == BATT_MODEL_NAME) {
@@ -1657,6 +2292,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	battmgr->dev = dev;
+	dev_set_drvdata(dev, battmgr);
 
 	psy_cfg.drv_data = battmgr;
 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
@@ -1680,6 +2316,12 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (ret < 0)
 		return dev_err_probe(dev, ret,
 				     "failed to init battery charge control thresholds\n");
+
+	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
+		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_attr_group);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "failed to add Xiaomi battery attributes\n");
+	}
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
