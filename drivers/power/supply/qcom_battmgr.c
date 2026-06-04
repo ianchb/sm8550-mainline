@@ -143,6 +143,14 @@ enum qcom_battmgr_variant {
 #define XM_BATT_QUICK_CHARGE_TYPE		0x31
 #define XM_BATT_APDO_MAX			0x32
 #define XM_BATT_POWER_MAX			0x33
+#define XM_BATT_PEN_TX_IOUT			0x55
+#define XM_BATT_PEN_TX_VOUT			0x56
+#define XM_BATT_PEN_SOC				0x57
+#define XM_BATT_PEN_HALL3			0x58
+#define XM_BATT_PEN_HALL4			0x59
+#define XM_BATT_PEN_TX_SS			0x5a
+#define XM_BATT_PEN_PLACE_ERR			0x5b
+#define XM_BATT_PEN_FAKE_SS			0x5c
 #define XM_BATT_FG_FAST_CHARGE			0x8f
 #define XM_BATT_SLAVE_AUTHENTIC		0xa5
 #define XM_BATT_PPS_PTF			0xe7
@@ -1324,6 +1332,14 @@ QCOM_BATTMGR_XIAOMI_ATTR_RW(pps_ptf, XM_BATT_PPS_PTF, QCOM_BATTMGR_XIAOMI_DEC);
 QCOM_BATTMGR_XIAOMI_ATTR_WO(fg_fastcharge, XM_BATT_FG_FAST_CHARGE, QCOM_BATTMGR_XIAOMI_DEC);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(apdo_max, XM_BATT_APDO_MAX, QCOM_BATTMGR_XIAOMI_DEC);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(power_max, XM_BATT_POWER_MAX, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(tx_iout, XM_BATT_PEN_TX_IOUT, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(tx_vout, XM_BATT_PEN_TX_VOUT, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_soc, XM_BATT_PEN_SOC, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_hall3, XM_BATT_PEN_HALL3, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_hall4, XM_BATT_PEN_HALL4, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_tx_ss, XM_BATT_PEN_TX_SS, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_place_err, XM_BATT_PEN_PLACE_ERR, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(fake_ss, XM_BATT_PEN_FAKE_SS, QCOM_BATTMGR_XIAOMI_DEC);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(pdo2, XM_BATT_PDO2, QCOM_BATTMGR_XIAOMI_HEX);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(adapter_svid, XM_BATT_ADAPTER_SVID, QCOM_BATTMGR_XIAOMI_DEC);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(adapter_id, XM_BATT_ADAPTER_ID, QCOM_BATTMGR_XIAOMI_HEX);
@@ -1359,6 +1375,14 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
 	&dev_attr_verify_digest.attr,
 	&qcom_battmgr_xiaomi_attr_apdo_max.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_power_max.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_tx_iout.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_tx_vout.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pen_soc.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pen_hall3.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pen_hall4.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pen_tx_ss.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pen_place_err.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_fake_ss.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_pdo2.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_adapter_svid.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_adapter_id.dev_attr.attr,
