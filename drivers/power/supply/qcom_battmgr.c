@@ -1370,28 +1370,13 @@ static DEVICE_ATTR_RW(verify_digest);
 		.format = _format,					\
 	}
 
-QCOM_BATTMGR_XIAOMI_ATTR_RO(real_type, XM_BATT_REAL_TYPE, QCOM_BATTMGR_XIAOMI_USB_TYPE);
 QCOM_BATTMGR_XIAOMI_ATTR_RW(authentic, XM_BATT_AUTHENTIC, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RW(slave_authentic, XM_BATT_SLAVE_AUTHENTIC, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(real_type, XM_BATT_REAL_TYPE, QCOM_BATTMGR_XIAOMI_USB_TYPE);
 QCOM_BATTMGR_XIAOMI_ATTR_RW(verify_process, XM_BATT_VERIFY_PROCESS, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(quick_charge_type, XM_BATT_QUICK_CHARGE_TYPE, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(fastchg_mode, XM_BATT_FASTCHGMODE, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RW(pd_verifed, XM_BATT_PD_VERIFED, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RW(pps_ptf, XM_BATT_PPS_PTF, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_WO(fg_fastcharge, XM_BATT_FG_FAST_CHARGE, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(apdo_max, XM_BATT_APDO_MAX, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(power_max, XM_BATT_POWER_MAX, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(tx_iout, XM_BATT_PEN_TX_IOUT, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(tx_vout, XM_BATT_PEN_TX_VOUT, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_soc, XM_BATT_PEN_SOC, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_hall3, XM_BATT_PEN_HALL3, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_hall4, XM_BATT_PEN_HALL4, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_tx_ss, XM_BATT_PEN_TX_SS, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_place_err, XM_BATT_PEN_PLACE_ERR, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RW(fake_ss, XM_BATT_PEN_FAKE_SS, QCOM_BATTMGR_XIAOMI_DEC);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(pdo2, XM_BATT_PDO2, QCOM_BATTMGR_XIAOMI_HEX);
-QCOM_BATTMGR_XIAOMI_ATTR_RO(adapter_svid, XM_BATT_ADAPTER_SVID, QCOM_BATTMGR_XIAOMI_DEC);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(adapter_id, XM_BATT_ADAPTER_ID, QCOM_BATTMGR_XIAOMI_HEX);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(adapter_svid, XM_BATT_ADAPTER_SVID, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(pd_verifed, XM_BATT_PD_VERIFED, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pdo2, XM_BATT_PDO2, QCOM_BATTMGR_XIAOMI_HEX);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_chip_ok, XM_BATT_BQ2597X_CHIP_OK, QCOM_BATTMGR_XIAOMI_DEC);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_slave_chip_ok, XM_BATT_BQ2597X_SLAVE_CHIP_OK,
 			    QCOM_BATTMGR_XIAOMI_DEC);
@@ -1408,20 +1393,41 @@ QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_slave_battery_present, XM_BATT_BQ2597X_SLAVE
 			    QCOM_BATTMGR_XIAOMI_DEC);
 QCOM_BATTMGR_XIAOMI_ATTR_RO(bq2597x_battery_voltage, XM_BATT_BQ2597X_BATTERY_VOLTAGE,
 			    QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(fastchg_mode, XM_BATT_FASTCHGMODE, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(quick_charge_type, XM_BATT_QUICK_CHARGE_TYPE, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(apdo_max, XM_BATT_APDO_MAX, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(power_max, XM_BATT_POWER_MAX, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(tx_iout, XM_BATT_PEN_TX_IOUT, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(tx_vout, XM_BATT_PEN_TX_VOUT, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_soc, XM_BATT_PEN_SOC, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_hall3, XM_BATT_PEN_HALL3, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_hall4, XM_BATT_PEN_HALL4, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_tx_ss, XM_BATT_PEN_TX_SS, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_place_err, XM_BATT_PEN_PLACE_ERR, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(fake_ss, XM_BATT_PEN_FAKE_SS, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_WO(fg_fastcharge, XM_BATT_FG_FAST_CHARGE, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(slave_authentic, XM_BATT_SLAVE_AUTHENTIC, QCOM_BATTMGR_XIAOMI_DEC);
+QCOM_BATTMGR_XIAOMI_ATTR_RW(pps_ptf, XM_BATT_PPS_PTF, QCOM_BATTMGR_XIAOMI_DEC);
 
 static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
-	&qcom_battmgr_xiaomi_attr_real_type.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_authentic.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_slave_authentic.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_real_type.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_verify_process.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_quick_charge_type.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_fastchg_mode.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_adapter_id.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_adapter_svid.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_pd_verifed.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_pps_ptf.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_fg_fastcharge.dev_attr.attr,
-	&dev_attr_request_vdm_cmd.attr,
-	&dev_attr_verify_slave_flag.attr,
-	&dev_attr_verify_digest.attr,
+	&qcom_battmgr_xiaomi_attr_pdo2.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_chip_ok.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_slave_chip_ok.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_bus_current.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_slave_bus_current.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_bus_delta.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_bus_voltage.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_battery_present.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_slave_battery_present.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_bq2597x_battery_voltage.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_fastchg_mode.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_quick_charge_type.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_apdo_max.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_power_max.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_tx_iout.dev_attr.attr,
@@ -1432,18 +1438,12 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
 	&qcom_battmgr_xiaomi_attr_pen_tx_ss.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_pen_place_err.dev_attr.attr,
 	&qcom_battmgr_xiaomi_attr_fake_ss.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_pdo2.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_adapter_svid.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_adapter_id.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_chip_ok.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_slave_chip_ok.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_bus_current.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_slave_bus_current.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_bus_delta.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_bus_voltage.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_battery_present.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_slave_battery_present.dev_attr.attr,
-	&qcom_battmgr_xiaomi_attr_bq2597x_battery_voltage.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_fg_fastcharge.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_slave_authentic.dev_attr.attr,
+	&qcom_battmgr_xiaomi_attr_pps_ptf.dev_attr.attr,
+	&dev_attr_request_vdm_cmd.attr,
+	&dev_attr_verify_slave_flag.attr,
+	&dev_attr_verify_digest.attr,
 	NULL
 };
 
