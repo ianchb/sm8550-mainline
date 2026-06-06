@@ -85,6 +85,7 @@ struct ov32d40 {
 	struct regmap *regmap;
 
 	bool streaming;
+	bool identified;
 
 	/*
 	 * Serialize control access, get/set format, get selection
@@ -1292,7 +1293,8 @@ static int ov32d40_s_stream(struct v4l2_subdev *sd, int on)
 		}
 	} else {
 		__ov32d40_stop_stream(ov32d40);
-		pm_runtime_put(&client->dev);
+		pm_runtime_mark_last_busy(&client->dev);
+		pm_runtime_put_autosuspend(&client->dev);
 	}
 
 	ov32d40->streaming = on;
@@ -1301,7 +1303,7 @@ static int ov32d40_s_stream(struct v4l2_subdev *sd, int on)
 	return 0;
 
 err_rpm_put:
-	pm_runtime_put(&client->dev);
+	pm_runtime_put_autosuspend(&client->dev);
 unlock_and_return:
 	mutex_unlock(&ov32d40->mutex);
 
@@ -1626,20 +1628,32 @@ static int ov32d40_check_sensor_id(struct ov32d40 *ov32d40)
 {
 	u64 chip_id;
 	int ret;
+	unsigned int i;
+
+	if (ov32d40->identified)
+		return 0;
 
 	/* Validate the chip ID */
-	ret = cci_read(ov32d40->regmap, OV32D40_REG_CHIP_ID, &chip_id, NULL);
-	if (ret < 0) {
-		dev_err(ov32d40->dev, "failed to read sensor information\n");
+	for (i = 0; i < 5; i++) {
+		ret = cci_read(ov32d40->regmap, OV32D40_REG_CHIP_ID,
+			       &chip_id, NULL);
+		if (!ret && chip_id == OV32D40_ID) {
+			ov32d40->identified = true;
+			return 0;
+		}
+
+		usleep_range(10000, 12000);
+	}
+	if (ret) {
+		dev_err(ov32d40->dev, "failed to read sensor information: %d\n",
+			ret);
 		return ret;
 	}
 
-	if (chip_id != OV32D40_ID) {
+	if (chip_id != OV32D40_ID)
 		dev_err(ov32d40->dev, "unexpected sensor id(0x%04llx)\n", chip_id);
-		return -EINVAL;
-	}
 
-	return 0;
+	return -EINVAL;
 }
 
 static int ov32d40_power_on(struct device *dev)
@@ -1655,31 +1669,31 @@ static int ov32d40_power_on(struct device *dev)
 				    ov32d40->supplies);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable regulators\n");
-		goto disable_clk;
+		return ret;
 	}
-	usleep_range(1000, 2000);
+	usleep_range(5000, 6000);
 
 	ret = clk_prepare_enable(ov32d40->mclk);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable mclk\n");
-		return ret;
+		goto disable_regulator;
 	}
-	usleep_range(1000, 2000);
+	usleep_range(10000, 12000);
 
 	gpiod_set_value_cansleep(ov32d40->reset_gpio, 0);
-	usleep_range(5000, 6000);
+	usleep_range(20000, 25000);
 
 	ret = ov32d40_check_sensor_id(ov32d40);
 	if (ret)
-		goto disable_regulator;
+		goto disable_clk;
 
 	return 0;
 
+disable_clk:
+	clk_disable_unprepare(ov32d40->mclk);
 disable_regulator:
 	regulator_bulk_disable(ARRAY_SIZE(ov32d40_supply_names),
 			       ov32d40->supplies);
-disable_clk:
-	clk_disable_unprepare(ov32d40->mclk);
 
 	return ret;
 }
@@ -1769,14 +1783,14 @@ static int ov32d40_probe(struct i2c_client *client)
 		goto err_free_handler;
 	}
 
-	pm_runtime_enable(ov32d40->dev);
-	if (!pm_runtime_enabled(ov32d40->dev)) {
-		ret = ov32d40_power_on(ov32d40->dev);
-		if (ret < 0) {
-			dev_err_probe(ov32d40->dev, ret, "failed to power on\n");
-			goto err_clean_entity;
-		}
+	ret = ov32d40_power_on(ov32d40->dev);
+	if (ret < 0) {
+		dev_err_probe(ov32d40->dev, ret, "failed to power on\n");
+		goto err_clean_entity;
 	}
+
+	pm_runtime_set_active(ov32d40->dev);
+	pm_runtime_enable(ov32d40->dev);
 
 	ret = v4l2_async_register_subdev_sensor(&ov32d40->subdev);
 	if (ret) {
@@ -1784,13 +1798,16 @@ static int ov32d40_probe(struct i2c_client *client)
 		goto err_power_off;
 	}
 
+	pm_runtime_set_autosuspend_delay(ov32d40->dev, 1000);
+	pm_runtime_use_autosuspend(ov32d40->dev);
+	pm_runtime_idle(ov32d40->dev);
+
 	return 0;
 
 err_power_off:
-	if (pm_runtime_enabled(ov32d40->dev))
-		pm_runtime_disable(ov32d40->dev);
-	else
-		ov32d40_power_off(ov32d40->dev);
+	pm_runtime_disable(ov32d40->dev);
+	pm_runtime_set_suspended(ov32d40->dev);
+	ov32d40_power_off(ov32d40->dev);
 err_clean_entity:
 	media_entity_cleanup(&ov32d40->subdev.entity);
 err_free_handler:
