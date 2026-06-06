@@ -87,6 +87,7 @@ struct s5kjn1 {
 	struct regmap *regmap;
 
 	bool streaming;
+	bool identified;
 
 	/*
 	 * Serialize control access, get/set format, get selection
@@ -1493,7 +1494,8 @@ static int s5kjn1_s_stream(struct v4l2_subdev *sd, int on)
 		}
 	} else {
 		__s5kjn1_stop_stream(s5kjn1);
-		pm_runtime_put(&client->dev);
+		pm_runtime_mark_last_busy(&client->dev);
+		pm_runtime_put_autosuspend(&client->dev);
 	}
 
 	s5kjn1->streaming = on;
@@ -1502,7 +1504,7 @@ static int s5kjn1_s_stream(struct v4l2_subdev *sd, int on)
 	return 0;
 
 err_rpm_put:
-	pm_runtime_put(&client->dev);
+	pm_runtime_put_autosuspend(&client->dev);
 unlock_and_return:
 	mutex_unlock(&s5kjn1->mutex);
 
@@ -1826,20 +1828,33 @@ static int s5kjn1_check_sensor_id(struct s5kjn1 *s5kjn1)
 {
 	u64 chip_id;
 	int ret;
+	unsigned int i;
+
+	if (s5kjn1->identified)
+		return 0;
 
 	/* Validate the chip ID */
-	ret = cci_read(s5kjn1->regmap, S5KJN1_REG_CHIP_ID, &chip_id, NULL);
+	for (i = 0; i < 5; i++) {
+		ret = cci_read(s5kjn1->regmap, S5KJN1_REG_CHIP_ID,
+			       &chip_id, NULL);
+		if (!ret && chip_id == S5KJN1_ID) {
+			s5kjn1->identified = true;
+			return 0;
+		}
+
+		usleep_range(10000, 12000);
+	}
+
 	if (ret < 0) {
-		dev_err(s5kjn1->dev, "failed to read sensor information\n");
+		dev_err(s5kjn1->dev, "failed to read sensor information: %d\n",
+			ret);
 		return ret;
 	}
 
-	if (chip_id != S5KJN1_ID) {
+	if (chip_id != S5KJN1_ID)
 		dev_err(s5kjn1->dev, "unexpected sensor id(0x%04llx)\n", chip_id);
-		return -EINVAL;
-	}
 
-	return 0;
+	return -EINVAL;
 }
 
 static int s5kjn1_power_on(struct device *dev)
@@ -1855,31 +1870,31 @@ static int s5kjn1_power_on(struct device *dev)
 				    s5kjn1->supplies);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable regulators\n");
-		goto disable_clk;
+		return ret;
 	}
-	usleep_range(1000, 2000);
+	usleep_range(5000, 6000);
 
 	ret = clk_prepare_enable(s5kjn1->mclk);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable mclk\n");
-		return ret;
+		goto disable_regulator;
 	}
-	usleep_range(1000, 2000);
+	usleep_range(10000, 12000);
 
 	gpiod_set_value_cansleep(s5kjn1->reset_gpio, 0);
-	usleep_range(12000, 13000);
+	usleep_range(20000, 25000);
 
 	ret = s5kjn1_check_sensor_id(s5kjn1);
 	if (ret)
-		goto disable_regulator;
+		goto disable_clk;
 
 	return 0;
 
+disable_clk:
+	clk_disable_unprepare(s5kjn1->mclk);
 disable_regulator:
 	regulator_bulk_disable(ARRAY_SIZE(s5kjn1_supply_names),
 			       s5kjn1->supplies);
-disable_clk:
-	clk_disable_unprepare(s5kjn1->mclk);
 
 	return ret;
 }
@@ -1969,14 +1984,14 @@ static int s5kjn1_probe(struct i2c_client *client)
 		goto err_free_handler;
 	}
 
-	pm_runtime_enable(s5kjn1->dev);
-	if (!pm_runtime_enabled(s5kjn1->dev)) {
-		ret = s5kjn1_power_on(s5kjn1->dev);
-		if (ret < 0) {
-			dev_err_probe(s5kjn1->dev, ret, "failed to power on\n");
-			goto err_clean_entity;
-		}
+	ret = s5kjn1_power_on(s5kjn1->dev);
+	if (ret < 0) {
+		dev_err_probe(s5kjn1->dev, ret, "failed to power on\n");
+		goto err_clean_entity;
 	}
+
+	pm_runtime_set_active(s5kjn1->dev);
+	pm_runtime_enable(s5kjn1->dev);
 
 	ret = v4l2_async_register_subdev_sensor(&s5kjn1->subdev);
 	if (ret) {
@@ -1984,13 +1999,16 @@ static int s5kjn1_probe(struct i2c_client *client)
 		goto err_power_off;
 	}
 
+	pm_runtime_set_autosuspend_delay(s5kjn1->dev, 1000);
+	pm_runtime_use_autosuspend(s5kjn1->dev);
+	pm_runtime_idle(s5kjn1->dev);
+
 	return 0;
 
 err_power_off:
-	if (pm_runtime_enabled(s5kjn1->dev))
-		pm_runtime_disable(s5kjn1->dev);
-	else
-		s5kjn1_power_off(s5kjn1->dev);
+	pm_runtime_disable(s5kjn1->dev);
+	pm_runtime_set_suspended(s5kjn1->dev);
+	s5kjn1_power_off(s5kjn1->dev);
 err_clean_entity:
 	media_entity_cleanup(&s5kjn1->subdev.entity);
 err_free_handler:
