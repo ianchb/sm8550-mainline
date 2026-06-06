@@ -151,8 +151,12 @@ enum qcom_battmgr_variant {
 #define XM_BATT_PEN_TX_SS			0x5a
 #define XM_BATT_PEN_PLACE_ERR			0x5b
 #define XM_BATT_PEN_FAKE_SS			0x5c
+#define XM_BATT_FG1_RM				0x8a
+#define XM_BATT_FG1_FCC			0x8b
 #define XM_BATT_FG_FAST_CHARGE			0x8f
 #define XM_BATT_SLAVE_AUTHENTIC		0xa5
+#define XM_BATT_FG2_RM				0xa6
+#define XM_BATT_FG2_FCC			0xa7
 #define XM_BATT_PPS_PTF			0xe7
 
 struct qcom_battmgr_enable_request {
@@ -474,6 +478,44 @@ static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, in
 	return ret;
 }
 
+static int qcom_battmgr_xiaomi_update_capacity(struct qcom_battmgr *battmgr)
+{
+	u32 fg1_rm, fg1_fcc, fg2_rm, fg2_fcc;
+	u64 rm, fcc;
+	int ret;
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+						   XM_BATT_FG1_RM, 0, &fg1_rm);
+	if (ret < 0)
+		return ret;
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+						   XM_BATT_FG1_FCC, 0, &fg1_fcc);
+	if (ret < 0)
+		return ret;
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+						   XM_BATT_FG2_RM, 0, &fg2_rm);
+	if (ret < 0)
+		return ret;
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+						   XM_BATT_FG2_FCC, 0, &fg2_fcc);
+	if (ret < 0)
+		return ret;
+
+	rm = (u64)fg1_rm + fg2_rm;
+	fcc = (u64)fg1_fcc + fg2_fcc;
+	if (!fcc)
+		return -ENODATA;
+
+	battmgr->status.percent = min_t(unsigned int,
+					DIV_ROUND_CLOSEST_ULL(rm * 100, fcc),
+					100);
+
+	return 0;
+}
+
 static int qcom_battmgr_xiaomi_request_vdm(struct qcom_battmgr *battmgr, int opcode,
 					   int property, const __le32 *data,
 					   __le32 *out_data)
@@ -646,6 +688,13 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
 		return -EINVAL;
 
 	prop = sm8350_bat_prop_map[psp];
+
+	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
+	    psp == POWER_SUPPLY_PROP_CAPACITY) {
+		ret = qcom_battmgr_xiaomi_update_capacity(battmgr);
+		if (!ret)
+			return 0;
+	}
 
 	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
