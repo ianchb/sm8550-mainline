@@ -83,6 +83,7 @@ struct ov02b1b {
 	struct regmap *regmap;
 
 	bool streaming;
+	bool identified;
 
 	/*
 	 * Serialize control access, get/set format, get selection
@@ -373,7 +374,8 @@ static int ov02b1b_s_stream(struct v4l2_subdev *sd, int on)
 		}
 	} else {
 		__ov02b1b_stop_stream(ov02b1b);
-		pm_runtime_put(&client->dev);
+		pm_runtime_mark_last_busy(&client->dev);
+		pm_runtime_put_autosuspend(&client->dev);
 	}
 
 	ov02b1b->streaming = on;
@@ -382,7 +384,7 @@ static int ov02b1b_s_stream(struct v4l2_subdev *sd, int on)
 	return 0;
 
 err_rpm_put:
-	pm_runtime_put(&client->dev);
+	pm_runtime_put_autosuspend(&client->dev);
 unlock_and_return:
 	mutex_unlock(&ov02b1b->mutex);
 
@@ -762,20 +764,33 @@ static int ov02b1b_check_sensor_id(struct ov02b1b *ov02b1b)
 {
 	u64 chip_id;
 	int ret;
+	unsigned int i;
+
+	if (ov02b1b->identified)
+		return 0;
 
 	/* Validate the chip ID */
-	ret = cci_read(ov02b1b->regmap, OV02B1B_REG_CHIP_ID, &chip_id, NULL);
-	if (ret < 0) {
-		dev_err(ov02b1b->dev, "failed to read sensor information\n");
+	for (i = 0; i < 5; i++) {
+		ret = cci_read(ov02b1b->regmap, OV02B1B_REG_CHIP_ID,
+			       &chip_id, NULL);
+		if (!ret && chip_id == OV02B1B_ID) {
+			ov02b1b->identified = true;
+			return 0;
+		}
+
+		usleep_range(10000, 12000);
+	}
+
+	if (ret) {
+		dev_err(ov02b1b->dev, "failed to read sensor information: %d\n",
+			ret);
 		return ret;
 	}
 
-	if (chip_id != OV02B1B_ID) {
+	if (chip_id != OV02B1B_ID)
 		dev_err(ov02b1b->dev, "unexpected sensor id(0x%04llx)\n", chip_id);
-		return -EINVAL;
-	}
 
-	return 0;
+	return -EINVAL;
 }
 
 static int ov02b1b_power_on(struct device *dev)
@@ -791,31 +806,31 @@ static int ov02b1b_power_on(struct device *dev)
 				    ov02b1b->supplies);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable regulators\n");
-		goto disable_clk;
+		return ret;
 	}
-	usleep_range(4000, 5000);
+	usleep_range(5000, 6000);
 
 	ret = clk_prepare_enable(ov02b1b->mclk);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable mclk\n");
-		return ret;
+		goto disable_regulator;
 	}
-	usleep_range(1000, 2000);
+	usleep_range(10000, 12000);
 
 	gpiod_set_value_cansleep(ov02b1b->reset_gpio, 0);
-	usleep_range(9000, 10000);
+	usleep_range(20000, 25000);
 
 	ret = ov02b1b_check_sensor_id(ov02b1b);
 	if (ret)
-		goto disable_regulator;
+		goto disable_clk;
 
 	return 0;
 
+disable_clk:
+	clk_disable_unprepare(ov02b1b->mclk);
 disable_regulator:
 	regulator_bulk_disable(ARRAY_SIZE(ov02b1b_supply_names),
 			       ov02b1b->supplies);
-disable_clk:
-	clk_disable_unprepare(ov02b1b->mclk);
 
 	return ret;
 }
@@ -905,14 +920,14 @@ static int ov02b1b_probe(struct i2c_client *client)
 		goto err_free_handler;
 	}
 
-	pm_runtime_enable(ov02b1b->dev);
-	if (!pm_runtime_enabled(ov02b1b->dev)) {
-		ret = ov02b1b_power_on(ov02b1b->dev);
-		if (ret < 0) {
-			dev_err_probe(ov02b1b->dev, ret, "failed to power on\n");
-			goto err_clean_entity;
-		}
+	ret = ov02b1b_power_on(ov02b1b->dev);
+	if (ret < 0) {
+		dev_err_probe(ov02b1b->dev, ret, "failed to power on\n");
+		goto err_clean_entity;
 	}
+
+	pm_runtime_set_active(ov02b1b->dev);
+	pm_runtime_enable(ov02b1b->dev);
 
 	ret = v4l2_async_register_subdev_sensor(&ov02b1b->subdev);
 	if (ret) {
@@ -920,13 +935,16 @@ static int ov02b1b_probe(struct i2c_client *client)
 		goto err_power_off;
 	}
 
+	pm_runtime_set_autosuspend_delay(ov02b1b->dev, 1000);
+	pm_runtime_use_autosuspend(ov02b1b->dev);
+	pm_runtime_idle(ov02b1b->dev);
+
 	return 0;
 
 err_power_off:
-	if (pm_runtime_enabled(ov02b1b->dev))
-		pm_runtime_disable(ov02b1b->dev);
-	else
-		ov02b1b_power_off(ov02b1b->dev);
+	pm_runtime_disable(ov02b1b->dev);
+	pm_runtime_set_suspended(ov02b1b->dev);
+	ov02b1b_power_off(ov02b1b->dev);
 err_clean_entity:
 	media_entity_cleanup(&ov02b1b->subdev.entity);
 err_free_handler:
