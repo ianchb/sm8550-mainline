@@ -367,7 +367,7 @@ static const struct dpu_perf_cfg sm8550_perf_data = {
 		{.rd_enable = 1, .wr_enable = 1},
 		{.rd_enable = 1, .wr_enable = 0}
 	},
-	.clk_inefficiency_factor = 105,
+	.clk_inefficiency_factor = 98,
 	.bw_inefficiency_factor = 120,
 };
 
