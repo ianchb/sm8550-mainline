@@ -1286,6 +1286,10 @@
 	status = "okay";
 };
 
+&mdss_dp0_out {
+	link-frequencies = /bits/ 64 <8100000000>;
+};
+
 &pcie0 {
 	wake-gpios = <&tlmm 96 GPIO_ACTIVE_HIGH>;
 	perst-gpios = <&tlmm 94 GPIO_ACTIVE_LOW>;
