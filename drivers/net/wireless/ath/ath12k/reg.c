@@ -300,7 +300,7 @@ int ath12k_regd_update(struct ath12k *ar, bool init)
 
 	if (supported_bands & WMI_HOST_WLAN_2GHZ_CAP) {
 		if (ab->hw_params->single_pdev_only) {
-			phy_id = ar->pdev->cap.band[WMI_HOST_WLAN_2GHZ_CAP].phy_id;
+			phy_id = ar->pdev->cap.band[NL80211_BAND_2GHZ].phy_id;
 			reg_cap = &ab->hal_reg_cap[phy_id];
 		}
 
@@ -310,16 +310,20 @@ int ath12k_regd_update(struct ath12k *ar, bool init)
 		ath12k_mac_update_freq_range(ar, freq_low, freq_high);
 	}
 
-	if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP && !ar->supports_6ghz) {
+	if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP) {
 		if (ab->hw_params->single_pdev_only) {
-			phy_id = ar->pdev->cap.band[WMI_HOST_WLAN_5GHZ_CAP].phy_id;
+			phy_id = ar->pdev->cap.band[NL80211_BAND_5GHZ].phy_id;
 			reg_cap = &ab->hal_reg_cap[phy_id];
 		}
 
-		freq_low = max(reg_cap->low_5ghz_chan, ab->reg_freq_5ghz.start_freq);
-		freq_high = min(reg_cap->high_5ghz_chan, ab->reg_freq_5ghz.end_freq);
+		if (reg_cap->low_5ghz_chan < ATH12K_MIN_6GHZ_FREQ) {
+			freq_low = max(reg_cap->low_5ghz_chan,
+				       ab->reg_freq_5ghz.start_freq);
+			freq_high = min(reg_cap->high_5ghz_chan,
+					ab->reg_freq_5ghz.end_freq);
 
-		ath12k_mac_update_freq_range(ar, freq_low, freq_high);
+			ath12k_mac_update_freq_range(ar, freq_low, freq_high);
+		}
 	}
 
 	if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP && ar->supports_6ghz) {
