@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/regmap.h>
+#include <linux/soc/qcom/qcom_battmgr.h>
 #include <linux/workqueue.h>
 
 #define WN8030_HEADER_ADDR 0x7FC0
@@ -517,6 +518,9 @@ static void nanosic_wn8030_add_touchpad_hid(struct nanosic_wn8030 *nanosic)
 
 static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf)
 {
+	bool notify_plugin = false;
+	bool plugin_attached = false;
+
 	/* WN8012(KB) -> HOST, kb detect/attach state info */
 	if (buf[5] == 0x38 && buf[6] == 0x80 && buf[7] == 0xa2) {
 		mutex_lock(&nanosic->conn_mutex);
@@ -528,6 +532,8 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
 			nanosic_wn8030_add_touchpad_hid(nanosic);
 			nanosic->keyboard_attached = true;
 			schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
+			notify_plugin = true;
+			plugin_attached = true;
 		} else if (((buf[12] & 0x3) == 0x0) && nanosic->keyboard_attached) {
 			cancel_delayed_work_sync(&nanosic->wake_worker);
 			if (nanosic->hid_keyboard) {
@@ -539,8 +545,20 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
 				nanosic->hid_touchpad = NULL;
 			}
 			nanosic->keyboard_attached = false;
+			notify_plugin = true;
+			plugin_attached = false;
 		}
 		mutex_unlock(&nanosic->conn_mutex);
+
+		if (notify_plugin) {
+			int ret;
+
+			ret = qcom_battmgr_set_keyboard_plugin(plugin_attached);
+			if (ret)
+				dev_dbg(nanosic->dev,
+					"failed to notify keyboard plugin=%u: %d\n",
+					plugin_attached, ret);
+		}
 	}
 	/* WN8012(KB) -> HOST, kb auth */
 	/* 0x0/0x1 - init auth, 0x64 - repeat request auth */
@@ -1030,6 +1048,9 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
 
 	disable_irq(nanosic->client->irq);
 	cancel_delayed_work_sync(&nanosic->wake_worker);
+
+	if (nanosic->keyboard_attached)
+		qcom_battmgr_set_keyboard_plugin(false);
 
 	misc_deregister(&nanosic->auth_misc);
 
