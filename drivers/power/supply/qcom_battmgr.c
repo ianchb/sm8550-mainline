@@ -12,6 +12,7 @@
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
+#include <linux/soc/qcom/qcom_battmgr.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/math.h>
@@ -111,6 +112,8 @@ enum qcom_battmgr_variant {
 /* Xiaomi vendor battery properties use a separate qti_battery_charger opcode pair. */
 #define BATTMGR_XM_PROPERTY_GET		0x50
 #define BATTMGR_XM_PROPERTY_SET		0x51
+
+#define BATTMGR_XM_KEYBOARD_PLUGIN		0xe4
 
 /* Xiaomi battery properties used by the vendor qti_battery_charger driver. */
 #define XM_BATT_VERIFY_DIGEST			0x01
@@ -418,6 +421,9 @@ struct qcom_battmgr {
 	struct mutex lock;
 };
 
+static struct qcom_battmgr *xiaomi_battmgr;
+static DEFINE_MUTEX(xiaomi_battmgr_lock);
+
 static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
 {
 	unsigned long left;
@@ -478,6 +484,36 @@ static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, in
 	mutex_unlock(&battmgr->lock);
 
 	return ret;
+}
+
+int qcom_battmgr_set_keyboard_plugin(bool attached)
+{
+	struct qcom_battmgr *battmgr;
+	int ret;
+
+	mutex_lock(&xiaomi_battmgr_lock);
+	battmgr = xiaomi_battmgr;
+	if (!battmgr) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_SET,
+						   BATTMGR_XM_KEYBOARD_PLUGIN,
+						   attached, NULL);
+out_unlock:
+	mutex_unlock(&xiaomi_battmgr_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_battmgr_set_keyboard_plugin);
+
+static void qcom_battmgr_clear_xiaomi_instance(void *data)
+{
+	mutex_lock(&xiaomi_battmgr_lock);
+	if (xiaomi_battmgr == data)
+		xiaomi_battmgr = NULL;
+	mutex_unlock(&xiaomi_battmgr_lock);
 }
 
 static int qcom_battmgr_xiaomi_update_capacity(struct qcom_battmgr *battmgr)
@@ -2400,6 +2436,15 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_attr_group);
 		if (ret < 0)
 			return dev_err_probe(dev, ret, "failed to add Xiaomi battery attributes\n");
+
+		mutex_lock(&xiaomi_battmgr_lock);
+		xiaomi_battmgr = battmgr;
+		mutex_unlock(&xiaomi_battmgr_lock);
+
+		ret = devm_add_action_or_reset(dev, qcom_battmgr_clear_xiaomi_instance,
+					       battmgr);
+		if (ret)
+			return ret;
 	}
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
