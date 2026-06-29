@@ -145,6 +145,19 @@ static u8 hid_keyboard_descriptor[] = {
 	0x2A, 0xA4, 0x00,  //   Usage Maximum (0xA4)
 	0x81, 0x00,        //   Input (Data,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
 	0xC0,              // End Collection
+
+	0x05, 0x0C,        // Usage Page (Consumer)
+	0x09, 0x01,        // Usage (Consumer Control)
+	0xA1, 0x01,        // Collection (Application)
+	0x85, 0x06,        //   Report ID (6)
+	0x19, 0x00,        //   Usage Minimum (Unassigned)
+	0x2A, 0xFF, 0x02,  //   Usage Maximum (0x02FF)
+	0x15, 0x00,        //   Logical Minimum (0)
+	0x26, 0xFF, 0x02,  //   Logical Maximum (767)
+	0x75, 0x10,        //   Report Size (16)
+	0x95, 0x01,        //   Report Count (1)
+	0x81, 0x00,        //   Input (Data,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+	0xC0,              // End Collection
 };
 
 static u8 hid_touchpad_descriptor[] = {
@@ -592,6 +605,11 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
 		if (nanosic->hid_keyboard)
 			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
 					 &buf[3], 9, 0);
+		break;
+	case 0x6:
+		if (nanosic->hid_keyboard)
+			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
+					 &buf[3], 3, 0);
 		break;
 	case 0x19:
 		if (nanosic->hid_touchpad)
