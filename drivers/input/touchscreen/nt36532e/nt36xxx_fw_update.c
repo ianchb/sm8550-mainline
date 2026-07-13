@@ -893,6 +893,7 @@ void Boot_Update_Firmware(struct work_struct *work)
 	nvt_set_doze_delay(120);
 	//enter doze mode
 	nvt_set_custom_cmd(0x01, 0x02);
+	nvt_thp_restore_stylus();
 	//test
 	//nvt_set_custom_cmd(0x08, 0x01);
 	//nvt_set_custom_cmd(0x07, 0x00);

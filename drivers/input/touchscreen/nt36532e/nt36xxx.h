@@ -19,7 +19,7 @@
 #define		_LINUX_NVT_TOUCH_H
 
 #include <linux/delay.h>
-#include <linux/input.h>
+#include <linux/kfifo.h>
 #include <linux/of.h>
 #include <linux/spi/spi.h>
 #include <linux/uaccess.h>
@@ -30,6 +30,8 @@
 #endif
 
 #include "nt36xxx_mem_map.h"
+
+struct proc_dir_entry;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 #define HAVE_PROC_OPS
@@ -59,29 +61,15 @@
 #endif
 #define NVT_ERR(fmt, args...)    pr_err("[%s] %s %d: " fmt, NVT_SPI_NAME, __func__, __LINE__, ##args)
 
-//---Input device info.---
-#define NVT_TS_NAME "NVTCapacitiveTouchScreen"
-#define NVT_PEN_NAME "NVTCapacitivePen"
-
 //---Touch info.---
 #define TOUCH_DEFAULT_NUM_X 60
 #define TOUCH_DEFAULT_NUM_Y 40
 #define TOUCH_DEFAULT_MAX_WIDTH 3048
 #define TOUCH_DEFAULT_MAX_HEIGHT 2032
-#define TOUCH_MAX_FINGER_NUM 10
-#define TOUCH_FORCE_NUM 1500
-//---for Pen---
-#define PEN_PRESSURE_MAX (4095)
-#define PEN_DISTANCE_MAX (1)
-#define PEN_TILT_MIN (-60)
-#define PEN_TILT_MAX (60)
 
 //---Customerized func.---
-#define MT_PROTOCOL_B 1
 #define BOOT_UPDATE_FIRMWARE 1
 #define BOOT_UPDATE_FIRMWARE_NAME "novatek/nt36532e.bin"
-#define MP_UPDATE_FIRMWARE_NAME   "novatek_nt36532e_mp.bin"
-#define NVT_SUPER_RESOLUTION_N 10
 #define POINT_DATA_LEN 760
 
 //---ESD Protect.---
@@ -104,22 +92,13 @@ enum nvt_ic_state {
 	NVT_IC_INIT,
 };
 
-struct ftouch {
-	uint32_t abs_x;
-	uint32_t abs_y;
-	bool active;
-};
-
 struct nvt_ts_data {
 	struct spi_device *client;
-	struct input_dev *input_dev;
 	struct delayed_work nvt_fwu_work;
-	struct mutex pen_switch_lock;
 	int ic_state;
 	bool dev_pm_suspend;
 	struct completion dev_pm_suspend_completion;
 	uint16_t addr;
-	int8_t phys[32];
 #if defined(CONFIG_DRM_PANEL)
 	struct drm_panel_follower panel_follower;
 #endif
@@ -129,7 +108,6 @@ struct nvt_ts_data {
 	uint8_t y_num;
 	uint16_t abs_x_max;
 	uint16_t abs_y_max;
-	uint8_t max_touch_num;
 	uint32_t int_trigger_type;
 	struct gpio_desc *irq_gpiod;
 	uint32_t irq_flags;
@@ -144,14 +122,7 @@ struct nvt_ts_data {
 	uint8_t *xbuf;
 	struct mutex xbuf_lock;
 	bool irq_enabled;
-	bool pen_support;
-	bool stylus_resol_double;
-	uint8_t x_gang_num;
-	uint8_t y_gang_num;
 	uint8_t debug_flag;
-	struct input_dev *pen_input_dev;
-	bool pen_input_dev_enable;
-	int8_t pen_phys[32];
 	int result_type;
 	int panel_index;
 	uint32_t chip_ver_trim_addr;
@@ -160,6 +131,25 @@ struct nvt_ts_data {
 	struct workqueue_struct *event_wq;
 	struct work_struct resume_work;
 	bool panel_on;
+	struct mutex thp_lock; /* protects the frame buffer and stream FIFO */
+	u8 *thp_frame;
+	bool thp_capture_enabled;
+	bool thp_stylus_enabled;
+	bool thp_frame_valid;
+	u64 thp_frame_count;
+	u64 thp_read_errors;
+	u64 thp_header_errors;
+	u64 thp_stream_drops;
+	u16 thp_header_crc;
+	u32 thp_magic;
+	ktime_t thp_timestamp;
+	struct kfifo thp_stream_fifo;
+	void *thp_stream_buf;
+	wait_queue_head_t thp_stream_wait;
+	struct proc_dir_entry *thp_raw_proc;
+	struct proc_dir_entry *thp_stream_proc;
+	struct proc_dir_entry *thp_status_proc;
+	struct proc_dir_entry *thp_stylus_proc;
 };
 
 typedef enum {
@@ -218,6 +208,7 @@ int32_t nvt_read_reg(nvt_ts_reg_t reg, uint8_t *val);
 int32_t nvt_check_spi_dma_tx_info(void);
 int32_t nvt_check_tx_auto_copy(void);
 int nvt_set_custom_cmd(u8 cmd, u16 value);
+int nvt_thp_restore_stylus(void);
 void nvt_set_doze_delay(u16 value);
 void Boot_Update_Firmware(struct work_struct *work);
 void thp_parse_frame(uint16_t* touch_matrix);
