@@ -50,8 +50,6 @@ static struct drm_panel_follower_funcs nt36xxx_panel_follower_funcs;
 #define NVT_THP_HEADER_LEN 257
 #define NVT_THP_PAYLOAD_LEN 5160
 #define NVT_THP_FRAME_LEN (NVT_THP_HEADER_LEN + NVT_THP_PAYLOAD_LEN)
-#define NVT_THP_EVENT_LEN (POINT_DATA_LEN + 1)
-#define NVT_THP_CAPTURE_LEN (NVT_THP_FRAME_LEN + NVT_THP_EVENT_LEN)
 #define NVT_THP_STREAM_SIZE (4 * 1024 * 1024)
 #define NVT_THP_STREAM_MAGIC 0x3150544e
 
@@ -80,56 +78,60 @@ static bool nvt_thp_header_valid(const u8 *frame, u16 *header_crc,
 	return crc_inv == (u16)~crc && marker_inv == ~marker;
 }
 
-static void nvt_thp_capture_frame(const u8 *point_data)
+static int nvt_thp_read_frame(u8 *fw_state)
 {
-	struct nvt_thp_stream_header header;
-	size_t record_len = sizeof(header) + NVT_THP_CAPTURE_LEN;
-	u16 header_crc;
-	u32 magic;
-	bool valid;
 	int ret;
-
-	if (!READ_ONCE(ts->thp_capture_enabled))
-		return;
 
 	mutex_lock(&ts->thp_lock);
 	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
 	ts->thp_frame[0] = 0;
 	ret = CTP_SPI_READ(ts->client, ts->thp_frame, NVT_THP_FRAME_LEN);
-	if (ret < 0) {
+	if (ret < 0)
 		ts->thp_read_errors++;
-	} else {
-		valid = nvt_thp_header_valid(ts->thp_frame, &header_crc, &magic);
-		ts->thp_frame_count++;
-		ts->thp_frame_valid = valid;
-		ts->thp_header_crc = header_crc;
-		ts->thp_magic = magic;
+	else {
+		memcpy(fw_state, ts->thp_frame, 7);
 		ts->thp_timestamp = ktime_get_boottime();
-		if (!valid)
-			ts->thp_header_errors++;
-
-		header.magic = cpu_to_le32(NVT_THP_STREAM_MAGIC);
-		header.header_len = cpu_to_le16(sizeof(header));
-		header.frame_len = cpu_to_le16(NVT_THP_CAPTURE_LEN);
-		header.sequence = cpu_to_le64(ts->thp_frame_count);
-		header.timestamp_ns = cpu_to_le64(ktime_to_ns(ts->thp_timestamp));
-		header.header_crc = cpu_to_le16(header_crc);
-		header.flags = cpu_to_le16(valid ? BIT(0) : 0);
-		header.firmware_magic = cpu_to_le32(magic);
-
-		memcpy(ts->thp_frame + NVT_THP_FRAME_LEN, point_data,
-		       NVT_THP_EVENT_LEN);
-		if (kfifo_avail(&ts->thp_stream_fifo) < record_len) {
-			ts->thp_stream_drops++;
-		} else {
-			kfifo_in(&ts->thp_stream_fifo, &header, sizeof(header));
-			kfifo_in(&ts->thp_stream_fifo, ts->thp_frame,
-				 NVT_THP_CAPTURE_LEN);
-		}
 	}
 	mutex_unlock(&ts->thp_lock);
-	if (ret >= 0)
-		wake_up_interruptible(&ts->thp_stream_wait);
+
+	return ret;
+}
+
+static void nvt_thp_publish_frame(void)
+{
+	struct nvt_thp_stream_header header;
+	size_t record_len = sizeof(header) + NVT_THP_FRAME_LEN;
+	u16 header_crc;
+	u32 magic;
+	bool valid;
+
+	mutex_lock(&ts->thp_lock);
+	valid = nvt_thp_header_valid(ts->thp_frame, &header_crc, &magic);
+	ts->thp_frame_count++;
+	ts->thp_frame_valid = valid;
+	ts->thp_header_crc = header_crc;
+	ts->thp_magic = magic;
+	if (!valid)
+		ts->thp_header_errors++;
+
+	header.magic = cpu_to_le32(NVT_THP_STREAM_MAGIC);
+	header.header_len = cpu_to_le16(sizeof(header));
+	header.frame_len = cpu_to_le16(NVT_THP_FRAME_LEN);
+	header.sequence = cpu_to_le64(ts->thp_frame_count);
+	header.timestamp_ns = cpu_to_le64(ktime_to_ns(ts->thp_timestamp));
+	header.header_crc = cpu_to_le16(header_crc);
+	header.flags = cpu_to_le16(valid ? BIT(0) : 0);
+	header.firmware_magic = cpu_to_le32(magic);
+
+	if (kfifo_avail(&ts->thp_stream_fifo) < record_len) {
+		ts->thp_stream_drops++;
+	} else {
+		kfifo_in(&ts->thp_stream_fifo, &header, sizeof(header));
+		kfifo_in(&ts->thp_stream_fifo, ts->thp_frame,
+			 NVT_THP_FRAME_LEN);
+	}
+	mutex_unlock(&ts->thp_lock);
+	wake_up_interruptible(&ts->thp_stream_wait);
 }
 
 static ssize_t nvt_thp_raw_write(struct file *file, const char __user *buf,
@@ -318,8 +320,7 @@ static int nvt_thp_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "stylus_enabled: %u\n", ts->thp_stylus_enabled);
 	seq_puts(m, "kernel_input: disabled\n");
 	seq_printf(m, "raw_frame_length: %u\n", NVT_THP_FRAME_LEN);
-	seq_printf(m, "event_length: %u\n", NVT_THP_EVENT_LEN);
-	seq_printf(m, "stream_frame_length: %u\n", NVT_THP_CAPTURE_LEN);
+	seq_printf(m, "stream_frame_length: %u\n", NVT_THP_FRAME_LEN);
 	seq_printf(m, "frames: %llu\n",
 		   (unsigned long long)ts->thp_frame_count);
 	seq_printf(m, "read_errors: %llu\n",
@@ -1258,8 +1259,8 @@ return:
 static irqreturn_t nvt_ts_work_func(int irq, void *data)
 {
 	int32_t ret = -1;
-	uint8_t point_data[POINT_DATA_LEN + 1 + DUMMY_BYTES];
-	uint8_t fw_state[7];
+	uint8_t fw_state[7] = { 0 };
+	bool frame_captured = false;
 
 	mutex_lock(&ts->lock);
 
@@ -1271,16 +1272,14 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		}
 	}
 
-	nvt_set_page(0x117700);
-	point_data[0] = 0x40; //0x117740
-	ret = CTP_SPI_READ(ts->client, point_data, POINT_DATA_LEN + 1);
-	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
-	if (ret < 0) {
-		NVT_ERR("CTP_SPI_READ failed.(%d)\n", ret);
-		goto XFER_ERROR;
+	if (READ_ONCE(ts->thp_capture_enabled)) {
+		ret = nvt_thp_read_frame(fw_state);
+		frame_captured = ret >= 0;
+	} else {
+		nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+		fw_state[0] = 0;
+		ret = CTP_SPI_READ(ts->client, fw_state, sizeof(fw_state));
 	}
-
-	ret = CTP_SPI_READ(ts->client, fw_state, 7);
 	if (ret < 0) {
 		NVT_ERR("CTP_SPI_READ failed.(%d)\n", ret);
 		goto XFER_ERROR;
@@ -1310,7 +1309,8 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		goto XFER_ERROR;
 	}
 
-	nvt_thp_capture_frame(point_data);
+	if (frame_captured)
+		nvt_thp_publish_frame();
 
 XFER_ERROR:
 
@@ -1573,7 +1573,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		goto err_chipvertrim_failed;
 	}
 
-	ts->thp_frame = kzalloc(NVT_THP_CAPTURE_LEN, GFP_KERNEL);
+	ts->thp_frame = kzalloc(NVT_THP_FRAME_LEN, GFP_KERNEL);
 	if (!ts->thp_frame) {
 		ret = -ENOMEM;
 		goto err_chipvertrim_failed;
