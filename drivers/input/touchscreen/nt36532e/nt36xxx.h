@@ -20,6 +20,7 @@
 
 #include <linux/delay.h>
 #include <linux/kfifo.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/spi/spi.h>
 #include <linux/uaccess.h>
@@ -130,6 +131,11 @@ struct nvt_ts_data {
 	uint32_t crc_err_flag_addr;
 	struct workqueue_struct *event_wq;
 	struct work_struct resume_work;
+	struct mutex power_supply_lock;
+	struct work_struct power_supply_work;
+	struct notifier_block power_supply_notifier;
+	int power_supply_status;
+	bool power_supply_registered;
 	bool panel_on;
 	struct mutex thp_lock; /* protects the frame buffer and stream FIFO */
 	u8 *thp_frame;
@@ -209,6 +215,7 @@ int32_t nvt_check_spi_dma_tx_info(void);
 int32_t nvt_check_tx_auto_copy(void);
 int nvt_set_custom_cmd(u8 cmd, u16 value);
 int nvt_thp_restore_stylus(void);
+void nvt_power_supply_restore(void);
 void nvt_set_doze_delay(u16 value);
 void Boot_Update_Firmware(struct work_struct *work);
 void thp_parse_frame(uint16_t* touch_matrix);
