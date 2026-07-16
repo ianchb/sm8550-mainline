@@ -898,5 +898,6 @@ void Boot_Update_Firmware(struct work_struct *work)
 	//nvt_set_custom_cmd(0x08, 0x01);
 	//nvt_set_custom_cmd(0x07, 0x00);
 	mutex_unlock(&ts->lock);
+	nvt_power_supply_restore();
 }
 #endif /* BOOT_UPDATE_FIRMWARE */
