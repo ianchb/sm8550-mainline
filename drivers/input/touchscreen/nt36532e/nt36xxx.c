@@ -23,6 +23,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/poll.h>
+#include <linux/power_supply.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of_irq.h>
 #include <linux/unaligned.h>
@@ -373,6 +374,55 @@ uint32_t ENG_RST_ADDR  = 0x7FFF80;
 uint32_t SPI_RD_FAST_ADDR = 0;	//read from dtsi
 
 static uint8_t bTouchIsAwake = 0;
+
+static void nvt_power_supply_work(struct work_struct *work)
+{
+	struct nvt_ts_data *ts_core = container_of(work, struct nvt_ts_data,
+						    power_supply_work);
+	u8 command[3] = { 0x50, 0x51, 0x00 };
+	int supplied;
+	int ret;
+
+	mutex_lock(&ts_core->power_supply_lock);
+	if (READ_ONCE(bTouchIsAwake) != 1)
+		goto out;
+
+	supplied = !!power_supply_is_system_supplied();
+	if (ts_core->power_supply_status == supplied)
+		goto out;
+
+	ts_core->power_supply_status = supplied;
+	command[1] = supplied ? 0x53 : 0x51;
+	ret = CTP_SPI_WRITE(ts_core->client, command, sizeof(command));
+	if (ret)
+		NVT_ERR("USB status set failed, ret=%d\n", ret);
+	else
+		NVT_LOG("charger mode=%d\n", supplied);
+
+out:
+	mutex_unlock(&ts_core->power_supply_lock);
+}
+
+static int nvt_power_supply_callback(struct notifier_block *nb,
+				     unsigned long event, void *data)
+{
+	struct nvt_ts_data *ts_core = container_of(nb, struct nvt_ts_data,
+						    power_supply_notifier);
+
+	queue_work(ts_core->event_wq, &ts_core->power_supply_work);
+	return NOTIFY_OK;
+}
+
+void nvt_power_supply_restore(void)
+{
+	if (!ts || !ts->power_supply_registered || !ts->event_wq)
+		return;
+
+	mutex_lock(&ts->power_supply_lock);
+	ts->power_supply_status = -1;
+	mutex_unlock(&ts->power_supply_lock);
+	queue_work(ts->event_wq, &ts->power_supply_work);
+}
 
 /*******************************************************
 Description:
@@ -1300,6 +1350,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		//enter doze mode
 		nvt_set_custom_cmd(0x01, 0x02);
 		nvt_thp_restore_stylus();
+		nvt_power_supply_restore();
 		goto XFER_ERROR;
 	}
 #endif /* #if NVT_TOUCH_WDT_RECOVERY */
@@ -1634,6 +1685,16 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	}
 
 	INIT_WORK(&ts->resume_work, nvt_resume_work);
+	mutex_init(&ts->power_supply_lock);
+	ts->power_supply_status = -1;
+	INIT_WORK(&ts->power_supply_work, nvt_power_supply_work);
+	ts->power_supply_notifier.notifier_call = nvt_power_supply_callback;
+	ret = power_supply_reg_notifier(&ts->power_supply_notifier);
+	if (ret) {
+		NVT_ERR("register power_supply_notifier failed, ret=%d\n", ret);
+		goto err_register_power_supply_notifier;
+	}
+	ts->power_supply_registered = true;
 
 	ts->thp_raw_proc = proc_create("nvt_thp_raw", 0200, NULL,
 				       &nvt_thp_raw_ops);
@@ -1665,6 +1726,11 @@ err_create_thp_proc:
 		proc_remove(ts->thp_stream_proc);
 	if (ts->thp_raw_proc)
 		proc_remove(ts->thp_raw_proc);
+	power_supply_unreg_notifier(&ts->power_supply_notifier);
+	ts->power_supply_registered = false;
+	cancel_work_sync(&ts->power_supply_work);
+err_register_power_supply_notifier:
+	mutex_destroy(&ts->power_supply_lock);
 	destroy_workqueue(ts->event_wq);
 	ts->event_wq = NULL;
 
@@ -1727,6 +1793,12 @@ static void nvt_ts_remove(struct spi_device *client)
 	proc_remove(ts->thp_stylus_proc);
 	proc_remove(ts->thp_stream_proc);
 	proc_remove(ts->thp_raw_proc);
+	if (ts->power_supply_registered) {
+		power_supply_unreg_notifier(&ts->power_supply_notifier);
+		ts->power_supply_registered = false;
+	}
+	cancel_work_sync(&ts->power_supply_work);
+	mutex_destroy(&ts->power_supply_lock);
 
 	destroy_workqueue(ts->event_wq);
 	ts->event_wq = NULL;
@@ -1778,6 +1850,11 @@ static void nvt_ts_shutdown(struct spi_device *client)
 	NVT_LOG("Shutdown driver...\n");
 
 	nvt_irq_enable(false);
+	if (ts->power_supply_registered) {
+		power_supply_unreg_notifier(&ts->power_supply_notifier);
+		ts->power_supply_registered = false;
+	}
+	cancel_work_sync(&ts->power_supply_work);
 
 	destroy_workqueue(ts->event_wq);
 	ts->event_wq = NULL;
@@ -1884,6 +1961,7 @@ static int32_t nvt_ts_resume(struct device *dev)
 	nvt_thp_restore_stylus();
 
 	mutex_unlock(&ts->lock);
+	nvt_power_supply_restore();
 
 	NVT_LOG("end\n");
 
