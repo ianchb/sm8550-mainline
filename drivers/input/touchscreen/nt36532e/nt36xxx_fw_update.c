@@ -856,6 +856,7 @@ int32_t nvt_update_firmware(const char *firmware_name)
 
 	NVT_LOG("Update firmware success! <%ld us>\n",
 			(long) ktime_us_delta(end, start));
+	nvt_thp_mark_epoch();
 
 	/* Get FW Info */
 	ret = nvt_get_fw_info();
