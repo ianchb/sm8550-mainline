@@ -113,6 +113,16 @@
 			linux,can-disable;
 			wakeup-source;
 		};
+
+		event-tablet-mode {
+			label = "Tablet Mode Switch";
+			gpios = <&tlmm 172 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_TABLET_MODE>;
+			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
 	};
 
 	pmic-glink {
@@ -1571,10 +1581,11 @@
 	};
 
 	hall_sensor_default: hall-sensor-default-state {
-		pins = "gpio171";
+		pins = "gpio171", "gpio172";
 		function = "gpio";
 		drive-strength = <2>;
 		bias-pull-up;
+		input-enable;
 	};
 
 	wcd_default: wcd-reset-n-active-state {
