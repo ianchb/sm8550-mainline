@@ -142,7 +142,9 @@ struct nvt_ts_data {
 	bool thp_capture_enabled;
 	bool thp_stylus_enabled;
 	bool thp_frame_valid;
+	bool thp_epoch_pending;
 	u64 thp_frame_count;
+	u64 thp_epoch_count;
 	u64 thp_read_errors;
 	u64 thp_header_errors;
 	u64 thp_stream_drops;
@@ -203,6 +205,7 @@ void nvt_fw_crc_enable(void);
 void nvt_tx_auto_copy_mode(void);
 void nvt_read_fw_history(uint32_t fw_history_addr);
 int32_t nvt_update_firmware(const char *firmware_name);
+void nvt_thp_mark_epoch(void);
 int32_t nvt_check_fw_reset_state(RST_COMPLETE_STATE check_reset_state);
 int32_t nvt_get_fw_info(void);
 int32_t nvt_clear_fw_status(void);

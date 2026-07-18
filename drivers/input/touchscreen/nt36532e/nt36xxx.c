@@ -53,6 +53,8 @@ static struct drm_panel_follower_funcs nt36xxx_panel_follower_funcs;
 #define NVT_THP_FRAME_LEN (NVT_THP_HEADER_LEN + NVT_THP_PAYLOAD_LEN)
 #define NVT_THP_STREAM_SIZE (4 * 1024 * 1024)
 #define NVT_THP_STREAM_MAGIC 0x3150544e
+#define NVT_THP_STREAM_FLAG_VALID BIT(0)
+#define NVT_THP_STREAM_FLAG_EPOCH BIT(1)
 
 struct nvt_thp_stream_header {
 	__le32 magic;
@@ -105,6 +107,7 @@ static void nvt_thp_publish_frame(void)
 	u16 header_crc;
 	u32 magic;
 	bool valid;
+	bool epoch;
 
 	mutex_lock(&ts->thp_lock);
 	valid = nvt_thp_header_valid(ts->thp_frame, &header_crc, &magic);
@@ -114,6 +117,9 @@ static void nvt_thp_publish_frame(void)
 	ts->thp_magic = magic;
 	if (!valid)
 		ts->thp_header_errors++;
+	epoch = valid && ts->thp_epoch_pending;
+	if (epoch)
+		ts->thp_epoch_pending = false;
 
 	header.magic = cpu_to_le32(NVT_THP_STREAM_MAGIC);
 	header.header_len = cpu_to_le16(sizeof(header));
@@ -121,7 +127,8 @@ static void nvt_thp_publish_frame(void)
 	header.sequence = cpu_to_le64(ts->thp_frame_count);
 	header.timestamp_ns = cpu_to_le64(ktime_to_ns(ts->thp_timestamp));
 	header.header_crc = cpu_to_le16(header_crc);
-	header.flags = cpu_to_le16(valid ? BIT(0) : 0);
+	header.flags = cpu_to_le16((valid ? NVT_THP_STREAM_FLAG_VALID : 0) |
+				       (epoch ? NVT_THP_STREAM_FLAG_EPOCH : 0));
 	header.firmware_magic = cpu_to_le32(magic);
 
 	if (kfifo_avail(&ts->thp_stream_fifo) < record_len) {
@@ -131,6 +138,20 @@ static void nvt_thp_publish_frame(void)
 		kfifo_in(&ts->thp_stream_fifo, ts->thp_frame,
 			 NVT_THP_FRAME_LEN);
 	}
+	mutex_unlock(&ts->thp_lock);
+	wake_up_interruptible(&ts->thp_stream_wait);
+}
+
+void nvt_thp_mark_epoch(void)
+{
+	if (!ts)
+		return;
+
+	mutex_lock(&ts->thp_lock);
+	ts->thp_epoch_pending = true;
+	ts->thp_epoch_count++;
+	if (ts->thp_capture_enabled)
+		kfifo_reset(&ts->thp_stream_fifo);
 	mutex_unlock(&ts->thp_lock);
 	wake_up_interruptible(&ts->thp_stream_wait);
 }
@@ -324,6 +345,9 @@ static int nvt_thp_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "stream_frame_length: %u\n", NVT_THP_FRAME_LEN);
 	seq_printf(m, "frames: %llu\n",
 		   (unsigned long long)ts->thp_frame_count);
+	seq_printf(m, "epochs: %llu\n",
+		   (unsigned long long)ts->thp_epoch_count);
+	seq_printf(m, "epoch_pending: %u\n", ts->thp_epoch_pending);
 	seq_printf(m, "read_errors: %llu\n",
 		   (unsigned long long)ts->thp_read_errors);
 	seq_printf(m, "header_errors: %llu\n",
