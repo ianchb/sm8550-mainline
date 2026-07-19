@@ -6,9 +6,27 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/firmware/qcom/qcom_tzmem.h>
+#include <linux/genalloc.h>
 #include <linux/mm.h>
+#include <linux/sizes.h>
 
 #include "qcomtee.h"
+
+/*
+ * Keep one maximum-sized inbound buffer available from boot.  Large QTEE
+ * clients otherwise allocate high-order pages after the system has been
+ * running for some time, when physical memory can be too fragmented even
+ * though plenty of memory remains available overall.
+ */
+#define QCOMTEE_SHM_PREALLOC_SIZE SZ_4M
+
+struct qcomtee_shm_pool {
+	struct gen_pool *genpool;
+	void *vaddr;
+	phys_addr_t paddr;
+	size_t size;
+	u64 sec_world_id;
+};
 
 /**
  * define MAX_OUTBOUND_BUFFER_SIZE - Maximum size of outbound buffers.
@@ -117,16 +135,56 @@ static int qcomtee_shm_unregister(struct tee_context *ctx, struct tee_shm *shm)
 static int pool_op_alloc(struct tee_shm_pool *pool, struct tee_shm *shm,
 			 size_t size, size_t align)
 {
+	struct qcomtee_shm_pool *qpool = pool->private_data;
+	struct genpool_data_align data = {
+		.align = max_t(size_t, align, PAGE_SIZE),
+	};
+	unsigned long vaddr;
+	size_t alloc_size = PAGE_ALIGN(size);
+
+	if (qpool) {
+		vaddr = gen_pool_alloc_algo(qpool->genpool, alloc_size,
+					    gen_pool_first_fit_align,
+					    &data);
+		if (vaddr) {
+			memset((void *)vaddr, 0, alloc_size);
+			shm->kaddr = (void *)vaddr;
+			shm->paddr = gen_pool_virt_to_phys(qpool->genpool,
+							   vaddr);
+			shm->size = alloc_size;
+			shm->flags &= ~TEE_SHM_DYNAMIC;
+
+			return 0;
+		}
+	}
+
 	return tee_dyn_shm_alloc_helper(shm, size, align, qcomtee_shm_register);
 }
 
 static void pool_op_free(struct tee_shm_pool *pool, struct tee_shm *shm)
 {
-	tee_dyn_shm_free_helper(shm, qcomtee_shm_unregister);
+	struct qcomtee_shm_pool *qpool = pool->private_data;
+
+	/* Dynamic allocations have a page array; preallocated chunks do not. */
+	if (shm->pages) {
+		tee_dyn_shm_free_helper(shm, qcomtee_shm_unregister);
+		return;
+	}
+
+	gen_pool_free(qpool->genpool, (unsigned long)shm->kaddr, shm->size);
+	shm->kaddr = NULL;
 }
 
 static void pool_op_destroy_pool(struct tee_shm_pool *pool)
 {
+	struct qcomtee_shm_pool *qpool = pool->private_data;
+
+	if (qpool) {
+		qcom_tzmem_shm_bridge_delete(qpool->sec_world_id);
+		gen_pool_destroy(qpool->genpool);
+		free_pages_exact(qpool->vaddr, qpool->size);
+		kfree(qpool);
+	}
 	kfree(pool);
 }
 
@@ -139,12 +197,60 @@ static const struct tee_shm_pool_ops pool_ops = {
 struct tee_shm_pool *qcomtee_shm_pool_alloc(void)
 {
 	struct tee_shm_pool *pool;
+	struct qcomtee_shm_pool *qpool;
+	int ret = -ENOMEM;
 
 	pool = kzalloc_obj(*pool);
 	if (!pool)
 		return ERR_PTR(-ENOMEM);
 
+	qpool = kzalloc_obj(*qpool);
+	if (!qpool)
+		goto err_free_pool;
+
+	qpool->size = QCOMTEE_SHM_PREALLOC_SIZE;
+	qpool->vaddr = alloc_pages_exact(qpool->size,
+					 GFP_KERNEL | __GFP_ZERO |
+					 __GFP_RETRY_MAYFAIL | __GFP_NOWARN);
+	if (!qpool->vaddr) {
+		pr_warn("failed to preallocate %zu-byte shared memory pool\n",
+			qpool->size);
+		kfree(qpool);
+		qpool = NULL;
+		goto use_dynamic_pool;
+	}
+
+	qpool->paddr = virt_to_phys(qpool->vaddr);
+	qpool->genpool = gen_pool_create(PAGE_SHIFT, -1);
+	if (!qpool->genpool)
+		goto err_free_pages;
+
+	ret = gen_pool_add_virt(qpool->genpool,
+				(unsigned long)qpool->vaddr, qpool->paddr,
+				qpool->size, -1);
+	if (ret)
+		goto err_destroy_genpool;
+
+	ret = qcom_tzmem_shm_bridge_create(qpool->paddr, qpool->size,
+					   &qpool->sec_world_id);
+	if (ret)
+		goto err_destroy_genpool;
+
+	pr_info("preallocated %zu-byte shared memory pool\n", qpool->size);
+
+use_dynamic_pool:
 	pool->ops = &pool_ops;
+	pool->private_data = qpool;
 
 	return pool;
+
+err_destroy_genpool:
+	gen_pool_destroy(qpool->genpool);
+err_free_pages:
+	free_pages_exact(qpool->vaddr, qpool->size);
+	kfree(qpool);
+err_free_pool:
+	kfree(pool);
+
+	return ERR_PTR(ret);
 }
