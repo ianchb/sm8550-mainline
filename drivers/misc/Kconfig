@@ -126,6 +126,18 @@ config TI_FPC202
 	  This driver can also be built as a module. If so, the module will be
 	  called fpc202.
 
+config FPC1553
+	tristate "FPC1553 fingerprint sensor platform support"
+	depends on OF && GPIOLIB && REGULATOR
+	help
+	  Enable the platform-side power, reset and interrupt controls for the
+	  Fingerprint Cards FPC1553 sensor used in the Xiaomi Pad 6S Pro 12.4.
+	  Sensor communication and matching are performed by its secure
+	  application, not by this driver.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called fpc1553.
+
 config TIFM_CORE
 	tristate "TI Flash Media interface support"
 	depends on PCI
