@@ -9,14 +9,20 @@
 #include <linux/firmware.h>
 #include <linux/hid.h>
 #include <linux/i2c.h>
+#include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <linux/leds.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/poll.h>
 #include <linux/regmap.h>
+#include <linux/slab.h>
 #include <linux/soc/qcom/qcom_battmgr.h>
+#include <linux/uaccess.h>
 #include <linux/workqueue.h>
+#include <uapi/linux/nanosic_hinge.h>
 
 #define WN8030_HEADER_ADDR 0x7FC0
 #define WN8030_CODE_ADDR 0x8000
@@ -43,9 +49,27 @@ struct nanosic_wn8030 {
 	struct regmap *regmap;
 	struct mutex conn_mutex;
 	struct delayed_work wake_worker;
+	struct work_struct input_state_work;
+	struct input_handler hall_handler;
+	struct input_handle hall_handle;
 
 	bool suspended;
 	bool keyboard_attached;
+	bool userspace_angle_enabled;
+	bool input_enabled;
+	bool lid_closed;
+	bool tablet_mode;
+	bool capslock_enabled;
+	struct led_classdev micmute_led;
+
+	/* Keyboard accelerometer and userspace angle policy. */
+	struct miscdevice hinge_misc;
+	/* Protects hinge_sample and hinge_sequence. */
+	spinlock_t hinge_lock;
+	wait_queue_head_t hinge_read_wq;
+	struct nanosic_hinge_sample hinge_sample;
+	u32 hinge_sequence;
+	bool hinge_open;
 
 	/* Authentication */
 	struct miscdevice auth_misc;
@@ -354,15 +378,42 @@ static inline u8 nanosic_wn8030_checksum8(const u8 *data, int size)
 	return checksum;
 }
 
-static int nanosic_wn8030_set_caps_led(struct nanosic_wn8030 *nanosic, bool enable)
+static int nanosic_wn8030_set_indicator_led(struct nanosic_wn8030 *nanosic, u8 state)
 {
 	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4E, 0x31,
 					0x80, 0x38, 0x2E, 0x01 };
 
-	buf[8] = enable ? 0xFD : 0xFC;
+	buf[8] = state;
 	buf[9] = nanosic_wn8030_checksum8(&buf[2], 7);
 
 	return regmap_bulk_write(nanosic->regmap, 0x5c, buf, sizeof(buf));
+}
+
+static int nanosic_wn8030_set_caps_led(struct nanosic_wn8030 *nanosic, bool enable)
+{
+	WRITE_ONCE(nanosic->capslock_enabled, enable);
+	if (!READ_ONCE(nanosic->input_enabled))
+		return 0;
+
+	return nanosic_wn8030_set_indicator_led(nanosic,
+						enable ? 0xFD : 0xFC);
+}
+
+static int nanosic_wn8030_micmute_led_set(struct led_classdev *led_cdev,
+					  enum led_brightness brightness)
+{
+	struct nanosic_wn8030 *nanosic =
+		container_of(led_cdev, struct nanosic_wn8030, micmute_led);
+	bool enable = brightness != LED_OFF;
+	int ret = 0;
+
+	mutex_lock(&nanosic->conn_mutex);
+	if (nanosic->keyboard_attached && !READ_ONCE(nanosic->suspended) &&
+	    nanosic->input_enabled)
+		ret = nanosic_wn8030_set_indicator_led(nanosic, enable ? 0xF7 : 0xF3);
+	mutex_unlock(&nanosic->conn_mutex);
+
+	return ret;
 }
 
 static int nanosic_wn8030_set_touchpad(struct nanosic_wn8030 *nanosic, bool enable)
@@ -516,21 +567,80 @@ static void nanosic_wn8030_add_touchpad_hid(struct nanosic_wn8030 *nanosic)
 	nanosic->hid_touchpad = hid;
 }
 
+static void nanosic_wn8030_publish_hinge(struct nanosic_wn8030 *nanosic,
+					 u16 flags, s16 x, s16 y, s16 z)
+{
+	struct nanosic_hinge_sample sample = {
+		.version = NANOSIC_HINGE_ABI_VERSION,
+		.flags = flags,
+		.x = x,
+		.y = y,
+		.z = z,
+	};
+	unsigned long irq_flags;
+
+	spin_lock_irqsave(&nanosic->hinge_lock, irq_flags);
+	nanosic->hinge_sample = sample;
+	WRITE_ONCE(nanosic->hinge_sequence, nanosic->hinge_sequence + 1);
+	spin_unlock_irqrestore(&nanosic->hinge_lock, irq_flags);
+	wake_up_interruptible_poll(&nanosic->hinge_read_wq,
+				   EPOLLIN | EPOLLRDNORM);
+}
+
+static ssize_t keyboard_attached_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct nanosic_wn8030 *nanosic = dev_get_drvdata(dev->parent);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(nanosic->keyboard_attached));
+}
+static DEVICE_ATTR_RO(keyboard_attached);
+
+static struct attribute *nanosic_hinge_attrs[] = {
+	&dev_attr_keyboard_attached.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(nanosic_hinge);
+
 static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf)
 {
 	bool notify_plugin = false;
 	bool plugin_attached = false;
 
+	/* WN8012(KB) -> HOST, keyboard accelerometer. */
+	if (buf[5] == 0x38 && buf[6] == 0x80 && buf[7] == 0x64 &&
+	    buf[8] == 0x06) {
+		u16 flags = NANOSIC_HINGE_SAMPLE_VALID;
+		int x, y, z;
+
+		x = sign_extend32(((u16)buf[10] << 4) | (buf[9] >> 4), 11);
+		y = sign_extend32(((u16)buf[12] << 4) | (buf[11] >> 4), 11);
+		z = sign_extend32(((u16)buf[14] << 4) | (buf[13] >> 4), 11);
+		if (READ_ONCE(nanosic->keyboard_attached))
+			flags |= NANOSIC_HINGE_SAMPLE_ATTACHED;
+		nanosic_wn8030_publish_hinge(nanosic, flags, x, -y, -z);
+	}
 	/* WN8012(KB) -> HOST, kb detect/attach state info */
-	if (buf[5] == 0x38 && buf[6] == 0x80 && buf[7] == 0xa2) {
+	else if (buf[5] == 0x38 && buf[6] == 0x80 && buf[7] == 0xa2) {
 		mutex_lock(&nanosic->conn_mutex);
 		if (((buf[12] & 0x3) == 0x3) && !nanosic->keyboard_attached) {
+			bool input_enabled = READ_ONCE(nanosic->input_enabled);
+
 			/* Caps LED state saved between reconnects by WN8030 */
 			nanosic_wn8030_set_caps_led(nanosic, false);
-			nanosic_wn8030_set_touchpad(nanosic, true);
+			nanosic_wn8030_set_touchpad(nanosic, input_enabled);
 			nanosic_wn8030_add_keyboard_hid(nanosic);
 			nanosic_wn8030_add_touchpad_hid(nanosic);
 			nanosic->keyboard_attached = true;
+			if (input_enabled) {
+				u8 micmute_led = READ_ONCE(nanosic->micmute_led.brightness) ?
+						  0xF7 : 0xF3;
+
+				nanosic_wn8030_set_indicator_led(nanosic, micmute_led);
+			} else {
+				nanosic_wn8030_set_indicator_led(nanosic, 0xFC);
+				nanosic_wn8030_set_indicator_led(nanosic, 0xF3);
+			}
 			schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
 			notify_plugin = true;
 			plugin_attached = true;
@@ -552,12 +662,22 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
 
 		if (notify_plugin) {
 			int ret;
+			u16 hinge_flags;
 
 			ret = qcom_battmgr_set_keyboard_plugin(plugin_attached);
 			if (ret)
 				dev_dbg(nanosic->dev,
 					"failed to notify keyboard plugin=%u: %d\n",
 					plugin_attached, ret);
+
+			hinge_flags = plugin_attached ?
+				NANOSIC_HINGE_SAMPLE_ATTACHED : 0;
+			nanosic_wn8030_publish_hinge(nanosic, hinge_flags,
+						     0, 0, 0);
+			sysfs_notify(&nanosic->hinge_misc.this_device->kobj, NULL,
+				     "keyboard_attached");
+			kobject_uevent(&nanosic->hinge_misc.this_device->kobj,
+				       KOBJ_CHANGE);
 		}
 	}
 	/* WN8012(KB) -> HOST, kb auth */
@@ -603,8 +723,8 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
 	/* After sleep pin deactivated, fw will trigger irq to notify about
 	 * successful resume, second irq will tell about kb connection state
 	 */
-	if (nanosic->suspended) {
-		nanosic->suspended = false;
+	if (READ_ONCE(nanosic->suspended)) {
+		WRITE_ONCE(nanosic->suspended, false);
 		return IRQ_HANDLED;
 	}
 
@@ -620,17 +740,19 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
 
 	switch (buf[3]) {
 	case 0x5:
+		if (!READ_ONCE(nanosic->input_enabled))
+			break;
 		if (nanosic->hid_keyboard)
 			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
 					 &buf[3], 9, 0);
 		break;
 	case 0x6:
-		if (nanosic->hid_keyboard)
+		if (READ_ONCE(nanosic->input_enabled) && nanosic->hid_keyboard)
 			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
 					 &buf[3], 3, 0);
 		break;
 	case 0x19:
-		if (nanosic->hid_touchpad)
+		if (READ_ONCE(nanosic->input_enabled) && nanosic->hid_touchpad)
 			hid_input_report(nanosic->hid_touchpad, HID_INPUT_REPORT,
 					 &buf[3], 21, 0);
 		break;
@@ -864,6 +986,253 @@ static void nanosic_wn8030_wake_worker(struct work_struct *data)
 	schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
 }
 
+static void nanosic_wn8030_release_inputs(struct nanosic_wn8030 *nanosic)
+{
+	u8 keyboard[9] = { 0x05 };
+	u8 consumer[3] = { 0x06 };
+	u8 touchpad[21] = { 0x19 };
+
+	if (nanosic->hid_keyboard) {
+		hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
+				 keyboard, sizeof(keyboard), 0);
+		hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
+				 consumer, sizeof(consumer), 0);
+	}
+	if (nanosic->hid_touchpad)
+		hid_input_report(nanosic->hid_touchpad, HID_INPUT_REPORT,
+				 touchpad, sizeof(touchpad), 0);
+}
+
+static void nanosic_wn8030_input_state_work(struct work_struct *work)
+{
+	struct nanosic_wn8030 *nanosic =
+		container_of(work, struct nanosic_wn8030, input_state_work);
+	bool enable = READ_ONCE(nanosic->userspace_angle_enabled) &&
+		      !READ_ONCE(nanosic->lid_closed) &&
+		      !READ_ONCE(nanosic->tablet_mode);
+	u8 caps_led;
+	u8 micmute_led;
+
+	mutex_lock(&nanosic->conn_mutex);
+	caps_led = READ_ONCE(nanosic->capslock_enabled) ? 0xFD : 0xFC;
+	micmute_led = READ_ONCE(nanosic->micmute_led.brightness) ? 0xF7 : 0xF3;
+	if (enable != READ_ONCE(nanosic->input_enabled)) {
+		WRITE_ONCE(nanosic->input_enabled, enable);
+		if (!enable)
+			nanosic_wn8030_release_inputs(nanosic);
+	}
+
+	if (!nanosic->keyboard_attached || READ_ONCE(nanosic->suspended))
+		goto out;
+
+	nanosic_wn8030_set_touchpad(nanosic, enable);
+	if (enable) {
+		nanosic_wn8030_set_indicator_led(nanosic, caps_led);
+		nanosic_wn8030_set_indicator_led(nanosic, micmute_led);
+	} else {
+		nanosic_wn8030_set_indicator_led(nanosic, 0xFC);
+		nanosic_wn8030_set_indicator_led(nanosic, 0xF3);
+	}
+
+out:
+	mutex_unlock(&nanosic->conn_mutex);
+}
+
+static void nanosic_wn8030_hall_event(struct input_handle *handle,
+				      unsigned int type,
+				      unsigned int code, int value)
+{
+	struct nanosic_wn8030 *nanosic = handle->private;
+
+	if (type != EV_SW || (code != SW_LID && code != SW_TABLET_MODE))
+		return;
+
+	if (code == SW_LID)
+		WRITE_ONCE(nanosic->lid_closed, value);
+	else
+		WRITE_ONCE(nanosic->tablet_mode, value);
+	schedule_work(&nanosic->input_state_work);
+}
+
+static int nanosic_wn8030_hall_connect(struct input_handler *handler,
+				       struct input_dev *dev,
+				       const struct input_device_id *id)
+{
+	struct nanosic_wn8030 *nanosic = handler->private;
+	struct input_handle *handle = &nanosic->hall_handle;
+	int ret;
+
+	if (handle->dev)
+		return -EEXIST;
+
+	handle->dev = input_get_device(dev);
+	handle->handler = handler;
+	handle->name = "nanosic-hall-state";
+	handle->private = nanosic;
+
+	ret = input_register_handle(handle);
+	if (ret)
+		goto err_put_device;
+
+	ret = input_open_device(handle);
+	if (ret)
+		goto err_unregister_handle;
+
+	WRITE_ONCE(nanosic->lid_closed, test_bit(SW_LID, dev->sw));
+	WRITE_ONCE(nanosic->tablet_mode, test_bit(SW_TABLET_MODE, dev->sw));
+	schedule_work(&nanosic->input_state_work);
+
+	return 0;
+
+err_unregister_handle:
+	input_unregister_handle(handle);
+err_put_device:
+	input_put_device(handle->dev);
+	handle->dev = NULL;
+	return ret;
+}
+
+static void nanosic_wn8030_hall_disconnect(struct input_handle *handle)
+{
+	struct nanosic_wn8030 *nanosic = handle->private;
+
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	input_put_device(handle->dev);
+	handle->dev = NULL;
+	WRITE_ONCE(nanosic->lid_closed, false);
+	WRITE_ONCE(nanosic->tablet_mode, false);
+	schedule_work(&nanosic->input_state_work);
+}
+
+static const struct input_device_id nanosic_wn8030_hall_ids[] = {
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
+			 INPUT_DEVICE_ID_MATCH_SWBIT,
+		.evbit = { [BIT_WORD(EV_SW)] = BIT_MASK(EV_SW) },
+		.swbit = { [BIT_WORD(SW_LID)] = BIT_MASK(SW_LID) |
+						BIT_MASK(SW_TABLET_MODE) },
+	},
+	{ }
+};
+
+struct nanosic_hinge_file {
+	struct nanosic_wn8030 *nanosic;
+	u32 sequence;
+};
+
+static int nanosic_hinge_open(struct inode *inode, struct file *file)
+{
+	struct nanosic_wn8030 *nanosic =
+		container_of(file->private_data, struct nanosic_wn8030, hinge_misc);
+	struct nanosic_hinge_file *ctx;
+
+	ctx = kzalloc_obj(*ctx);
+	if (!ctx)
+		return -ENOMEM;
+
+	mutex_lock(&nanosic->conn_mutex);
+	if (nanosic->hinge_open) {
+		mutex_unlock(&nanosic->conn_mutex);
+		kfree(ctx);
+		return -EBUSY;
+	}
+	nanosic->hinge_open = true;
+	mutex_unlock(&nanosic->conn_mutex);
+
+	ctx->nanosic = nanosic;
+	file->private_data = ctx;
+	return 0;
+}
+
+static int nanosic_hinge_release(struct inode *inode, struct file *file)
+{
+	struct nanosic_hinge_file *ctx = file->private_data;
+	struct nanosic_wn8030 *nanosic = ctx->nanosic;
+
+	mutex_lock(&nanosic->conn_mutex);
+	nanosic->hinge_open = false;
+	WRITE_ONCE(nanosic->userspace_angle_enabled, true);
+	mutex_unlock(&nanosic->conn_mutex);
+	schedule_work(&nanosic->input_state_work);
+	kfree(ctx);
+	return 0;
+}
+
+static ssize_t nanosic_hinge_read(struct file *file, char __user *buf,
+				  size_t count, loff_t *off)
+{
+	struct nanosic_hinge_file *ctx = file->private_data;
+	struct nanosic_wn8030 *nanosic = ctx->nanosic;
+	struct nanosic_hinge_sample sample;
+	unsigned long flags;
+	int ret;
+
+	if (count != sizeof(sample))
+		return -EINVAL;
+
+	if (file->f_flags & O_NONBLOCK) {
+		if (READ_ONCE(nanosic->hinge_sequence) == ctx->sequence)
+			return -EAGAIN;
+	} else {
+		ret = wait_event_interruptible(nanosic->hinge_read_wq,
+					       READ_ONCE(nanosic->hinge_sequence) !=
+					       ctx->sequence);
+		if (ret)
+			return ret;
+	}
+
+	spin_lock_irqsave(&nanosic->hinge_lock, flags);
+	sample = nanosic->hinge_sample;
+	ctx->sequence = nanosic->hinge_sequence;
+	spin_unlock_irqrestore(&nanosic->hinge_lock, flags);
+
+	if (copy_to_user(buf, &sample, sizeof(sample)))
+		return -EFAULT;
+	return sizeof(sample);
+}
+
+static ssize_t nanosic_hinge_write(struct file *file, const char __user *buf,
+				   size_t count, loff_t *off)
+{
+	struct nanosic_hinge_file *ctx = file->private_data;
+	struct nanosic_hinge_control control;
+
+	if (count != sizeof(control))
+		return -EINVAL;
+	if (copy_from_user(&control, buf, sizeof(control)))
+		return -EFAULT;
+	if (control.version != NANOSIC_HINGE_ABI_VERSION ||
+	    control.flags & ~NANOSIC_HINGE_CONTROL_ENABLE)
+		return -EINVAL;
+
+	WRITE_ONCE(ctx->nanosic->userspace_angle_enabled,
+		   control.flags & NANOSIC_HINGE_CONTROL_ENABLE);
+	schedule_work(&ctx->nanosic->input_state_work);
+	return sizeof(control);
+}
+
+static __poll_t nanosic_hinge_poll(struct file *file, poll_table *wait)
+{
+	struct nanosic_hinge_file *ctx = file->private_data;
+	struct nanosic_wn8030 *nanosic = ctx->nanosic;
+
+	poll_wait(file, &nanosic->hinge_read_wq, wait);
+	if (READ_ONCE(nanosic->hinge_sequence) != ctx->sequence)
+		return EPOLLIN | EPOLLRDNORM;
+	return 0;
+}
+
+static const struct file_operations nanosic_hinge_fops = {
+	.owner = THIS_MODULE,
+	.open = nanosic_hinge_open,
+	.release = nanosic_hinge_release,
+	.read = nanosic_hinge_read,
+	.write = nanosic_hinge_write,
+	.poll = nanosic_hinge_poll,
+	.llseek = noop_llseek,
+};
+
 struct nanosic_auth_req {
 	u8 uid[16];
 	u8 challenge[16];
@@ -991,9 +1360,22 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	i2c_set_clientdata(client, nanosic);
 
 	INIT_DELAYED_WORK(&nanosic->wake_worker, nanosic_wn8030_wake_worker);
+	INIT_WORK(&nanosic->input_state_work, nanosic_wn8030_input_state_work);
+	nanosic->userspace_angle_enabled = true;
+	nanosic->input_enabled = true;
+	nanosic->hall_handler.event = nanosic_wn8030_hall_event;
+	nanosic->hall_handler.connect = nanosic_wn8030_hall_connect;
+	nanosic->hall_handler.disconnect = nanosic_wn8030_hall_disconnect;
+	nanosic->hall_handler.name = "nanosic-hall-state";
+	nanosic->hall_handler.id_table = nanosic_wn8030_hall_ids;
+	nanosic->hall_handler.private = nanosic;
 
 	init_waitqueue_head(&nanosic->auth_read_wq);
 	init_completion(&nanosic->auth_token_ready);
+	spin_lock_init(&nanosic->hinge_lock);
+	init_waitqueue_head(&nanosic->hinge_read_wq);
+	nanosic->hinge_sample.version = NANOSIC_HINGE_ABI_VERSION;
+	nanosic->hinge_sequence = 1;
 
 	nanosic->auth_open = false;
 	nanosic->auth_misc.minor = MISC_DYNAMIC_MINOR;
@@ -1004,6 +1386,17 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	if (ret) {
 		dev_err(nanosic->dev, "failed to register misc device\n");
 		goto err;
+	}
+
+	nanosic->hinge_misc.minor = MISC_DYNAMIC_MINOR;
+	nanosic->hinge_misc.name = "nanosic_hinge";
+	nanosic->hinge_misc.fops = &nanosic_hinge_fops;
+	nanosic->hinge_misc.parent = nanosic->dev;
+	nanosic->hinge_misc.groups = nanosic_hinge_groups;
+	ret = misc_register(&nanosic->hinge_misc);
+	if (ret) {
+		dev_err(nanosic->dev, "failed to register hinge misc device\n");
+		goto err_auth_misc;
 	}
 
 	ret = nanosic_wn8030_check_boot_id(nanosic);
@@ -1023,18 +1416,39 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	if (ret)
 		goto err_misc;
 
+	nanosic->micmute_led.name = "nanosic::micmute";
+	nanosic->micmute_led.max_brightness = 1;
+	nanosic->micmute_led.brightness_set_blocking =
+		nanosic_wn8030_micmute_led_set;
+	ret = devm_led_classdev_register(nanosic->dev, &nanosic->micmute_led);
+	if (ret)
+		goto err_misc;
+
+	ret = input_register_handler(&nanosic->hall_handler);
+	if (ret) {
+		dev_err(nanosic->dev, "failed to register hall state handler\n");
+		goto err_led;
+	}
+
 	ret = devm_request_threaded_irq(&client->dev, client->irq,
 					NULL, nanosic_wn8030_handler,
 					IRQF_ONESHOT | IRQF_TRIGGER_RISING,
 					"nanosic_wn8030_irq", nanosic);
 	if (ret) {
 		ret = dev_err_probe(nanosic->dev, ret, "failed to request irq %d\n", client->irq);
-		goto err_misc;
+		goto err_input;
 	}
 
 	return 0;
 
+err_input:
+	input_unregister_handler(&nanosic->hall_handler);
+	cancel_work_sync(&nanosic->input_state_work);
+err_led:
+	devm_led_classdev_unregister(nanosic->dev, &nanosic->micmute_led);
 err_misc:
+	misc_deregister(&nanosic->hinge_misc);
+err_auth_misc:
 	misc_deregister(&nanosic->auth_misc);
 err:
 	nanosic_wn8030_power_off(nanosic);
@@ -1046,12 +1460,16 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
 {
 	struct nanosic_wn8030 *nanosic = i2c_get_clientdata(client);
 
+	devm_led_classdev_unregister(nanosic->dev, &nanosic->micmute_led);
+	input_unregister_handler(&nanosic->hall_handler);
+	cancel_work_sync(&nanosic->input_state_work);
 	disable_irq(nanosic->client->irq);
 	cancel_delayed_work_sync(&nanosic->wake_worker);
 
 	if (nanosic->keyboard_attached)
 		qcom_battmgr_set_keyboard_plugin(false);
 
+	misc_deregister(&nanosic->hinge_misc);
 	misc_deregister(&nanosic->auth_misc);
 
 	if (nanosic->hid_keyboard)
@@ -1070,18 +1488,19 @@ static int nanosic_wn8030_resume(struct device *dev)
 	gpiod_set_value_cansleep(nanosic->sleep_gpio, 0);
 	msleep(25);
 
-	if (nanosic->suspended) {
+	if (READ_ONCE(nanosic->suspended)) {
 		dev_warn(dev, "timeout waiting for chip resume. Reseting chip...\n");
 		gpiod_set_value_cansleep(nanosic->reset_gpio, 1);
 		msleep(10);
 		gpiod_set_value_cansleep(nanosic->reset_gpio, 0);
 		msleep(20);
-		nanosic->suspended = false;
+		WRITE_ONCE(nanosic->suspended, false);
 		return nanosic_wn8030_load_fw(nanosic);
 	}
 
 	/* Wake up keyboard after MCU exits sleep */
 	nanosic_wn8030_set_kb_power(nanosic, true);
+	schedule_work(&nanosic->input_state_work);
 
 	return 0;
 }
@@ -1090,12 +1509,13 @@ static int nanosic_wn8030_suspend(struct device *dev)
 {
 	struct nanosic_wn8030 *nanosic = dev_get_drvdata(dev);
 
+	WRITE_ONCE(nanosic->suspended, true);
 	disable_irq(nanosic->client->irq);
 	cancel_delayed_work_sync(&nanosic->wake_worker);
+	cancel_work_sync(&nanosic->input_state_work);
 
 	gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
 	msleep(10);
-	nanosic->suspended = true;
 
 	return 0;
 }
