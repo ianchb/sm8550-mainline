@@ -60,6 +60,7 @@ struct nanosic_wn8030 {
 	bool lid_closed;
 	bool tablet_mode;
 	bool capslock_enabled;
+	bool micmute_key_down;
 	struct led_classdev micmute_led;
 
 	/* Keyboard accelerometer and userspace angle policy. */
@@ -399,21 +400,40 @@ static int nanosic_wn8030_set_caps_led(struct nanosic_wn8030 *nanosic, bool enab
 						enable ? 0xFD : 0xFC);
 }
 
+static int nanosic_wn8030_sync_micmute_led(struct nanosic_wn8030 *nanosic, bool enable)
+{
+	if (!nanosic->keyboard_attached || READ_ONCE(nanosic->suspended) ||
+	    !nanosic->input_enabled || nanosic->micmute_key_down)
+		return 0;
+
+	return nanosic_wn8030_set_indicator_led(nanosic,
+						enable ? 0xF7 : 0xF3);
+}
+
 static int nanosic_wn8030_micmute_led_set(struct led_classdev *led_cdev,
 					  enum led_brightness brightness)
 {
 	struct nanosic_wn8030 *nanosic =
 		container_of(led_cdev, struct nanosic_wn8030, micmute_led);
-	bool enable = brightness != LED_OFF;
-	int ret = 0;
+	int ret;
 
 	mutex_lock(&nanosic->conn_mutex);
-	if (nanosic->keyboard_attached && !READ_ONCE(nanosic->suspended) &&
-	    nanosic->input_enabled)
-		ret = nanosic_wn8030_set_indicator_led(nanosic, enable ? 0xF7 : 0xF3);
+	ret = nanosic_wn8030_sync_micmute_led(nanosic,
+					      brightness != LED_OFF);
 	mutex_unlock(&nanosic->conn_mutex);
 
 	return ret;
+}
+
+static bool nanosic_wn8030_report_has_key(const u8 *report, u8 usage)
+{
+	int i;
+
+	for (i = 3; i < 9; i++)
+		if (report[i] == usage)
+			return true;
+
+	return false;
 }
 
 static int nanosic_wn8030_set_touchpad(struct nanosic_wn8030 *nanosic, bool enable)
@@ -646,6 +666,7 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
 			plugin_attached = true;
 		} else if (((buf[12] & 0x3) == 0x0) && nanosic->keyboard_attached) {
 			cancel_delayed_work_sync(&nanosic->wake_worker);
+			nanosic->micmute_key_down = false;
 			if (nanosic->hid_keyboard) {
 				hid_destroy_device(nanosic->hid_keyboard);
 				nanosic->hid_keyboard = NULL;
@@ -739,13 +760,31 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
 		return IRQ_HANDLED;
 
 	switch (buf[3]) {
-	case 0x5:
+	case 0x5: {
+		bool micmute_down;
+		bool micmute_was_down;
+
 		if (!READ_ONCE(nanosic->input_enabled))
 			break;
+		micmute_down = nanosic_wn8030_report_has_key(&buf[3], 0x6f);
+		micmute_was_down = READ_ONCE(nanosic->micmute_key_down);
+		if (micmute_down && !micmute_was_down)
+			WRITE_ONCE(nanosic->micmute_key_down, true);
 		if (nanosic->hid_keyboard)
 			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
 					 &buf[3], 9, 0);
+		if (!micmute_down && micmute_was_down) {
+			bool enable;
+
+			/* Do not send the LED command before the key release report. */
+			mutex_lock(&nanosic->conn_mutex);
+			nanosic->micmute_key_down = false;
+			enable = READ_ONCE(nanosic->micmute_led.brightness) != LED_OFF;
+			nanosic_wn8030_sync_micmute_led(nanosic, enable);
+			mutex_unlock(&nanosic->conn_mutex);
+		}
 		break;
+	}
 	case 0x6:
 		if (READ_ONCE(nanosic->input_enabled) && nanosic->hid_keyboard)
 			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
@@ -1001,6 +1040,7 @@ static void nanosic_wn8030_release_inputs(struct nanosic_wn8030 *nanosic)
 	if (nanosic->hid_touchpad)
 		hid_input_report(nanosic->hid_touchpad, HID_INPUT_REPORT,
 				 touchpad, sizeof(touchpad), 0);
+	WRITE_ONCE(nanosic->micmute_key_down, false);
 }
 
 static void nanosic_wn8030_input_state_work(struct work_struct *work)
