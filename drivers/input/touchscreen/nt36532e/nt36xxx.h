@@ -140,7 +140,7 @@ struct nvt_ts_data {
 	struct mutex thp_lock; /* protects the frame buffer and stream FIFO */
 	u8 *thp_frame;
 	bool thp_capture_enabled;
-	bool thp_stylus_enabled;
+	u8 thp_stylus_mode;
 	bool thp_frame_valid;
 	bool thp_epoch_pending;
 	u64 thp_frame_count;
