@@ -191,7 +191,7 @@ static ssize_t nvt_thp_stylus_read(struct file *file, char __user *buf,
 		return -ENODEV;
 
 	len = scnprintf(value, sizeof(value), "%u\n",
-			READ_ONCE(ts->thp_stylus_enabled));
+			READ_ONCE(ts->thp_stylus_mode));
 	return simple_read_from_buffer(buf, count, ppos, value, len);
 }
 
@@ -234,25 +234,27 @@ static ssize_t nvt_thp_stylus_write(struct file *file,
 				    loff_t *ppos)
 {
 	bool irq_was_enabled;
-	bool enable;
+	u8 mode;
 	int ret;
 
 	if (!ts)
 		return -ENODEV;
 
-	ret = kstrtobool_from_user(buf, count, &enable);
+	ret = kstrtou8_from_user(buf, count, 0, &mode);
 	if (ret)
 		return ret;
+	if (mode != 0 && mode != 1 && mode != 3)
+		return -EINVAL;
 
 	irq_was_enabled = READ_ONCE(ts->irq_enabled);
 	if (irq_was_enabled)
 		nvt_irq_enable(false);
 	mutex_lock(&ts->lock);
-	ret = nvt_set_custom_cmd(0x04, enable);
-	if (!ret && enable)
-		ret = nvt_thp_set_pen_switch(1);
+	ret = nvt_set_custom_cmd(0x04, mode != 0);
+	if (!ret && mode)
+		ret = nvt_thp_set_pen_switch(mode);
 	if (!ret)
-		ts->thp_stylus_enabled = enable;
+		ts->thp_stylus_mode = mode;
 	mutex_unlock(&ts->lock);
 	if (irq_was_enabled)
 		nvt_irq_enable(true);
@@ -260,20 +262,22 @@ static ssize_t nvt_thp_stylus_write(struct file *file,
 	if (ret)
 		return ret;
 
-	NVT_ERR("THP stylus scanning %s\n", enable ? "enabled" : "disabled");
+	NVT_ERR("THP stylus scanning mode %u\n", mode);
 	return count;
 }
 
 int nvt_thp_restore_stylus(void)
 {
+	u8 mode;
 	int ret;
 
-	if (!READ_ONCE(ts->thp_stylus_enabled))
+	mode = READ_ONCE(ts->thp_stylus_mode);
+	if (!mode)
 		return 0;
 
 	ret = nvt_set_custom_cmd(0x04, 1);
 	if (!ret)
-		ret = nvt_thp_set_pen_switch(1);
+		ret = nvt_thp_set_pen_switch(mode);
 	if (ret)
 		NVT_ERR("failed to restore THP stylus state: %d\n", ret);
 
@@ -339,7 +343,8 @@ static int nvt_thp_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "enabled: %u\n", ts->thp_capture_enabled);
 	seq_printf(m, "event_buffer: 0x%06x\n", ts->mmap->EVENT_BUF_ADDR);
 	seq_printf(m, "firmware: %s\n", ts->fw_name);
-	seq_printf(m, "stylus_enabled: %u\n", ts->thp_stylus_enabled);
+	seq_printf(m, "stylus_enabled: %u\n", ts->thp_stylus_mode != 0);
+	seq_printf(m, "stylus_mode: %u\n", ts->thp_stylus_mode);
 	seq_puts(m, "kernel_input: disabled\n");
 	seq_printf(m, "raw_frame_length: %u\n", NVT_THP_FRAME_LEN);
 	seq_printf(m, "stream_frame_length: %u\n", NVT_THP_FRAME_LEN);
