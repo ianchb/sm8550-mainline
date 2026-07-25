@@ -885,6 +885,9 @@
 
 		lens-focus = <&gt9764>;
 		flash-leds = <&rear_camera_flash>;
+		leds = <&green_led>;
+		led-names = "activity";
+		activity-led-brightness = <75>;
 
 		vddio-supply = <&vreg_l4b_1p8>;
 		vddd-supply = <&vreg_l2m_1p08>;
@@ -955,6 +958,10 @@
 		reset-gpios = <&tlmm 120 GPIO_ACTIVE_LOW>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&cam4_default>, <&cam_front_reset_default>;
+
+		leds = <&green_led>;
+		led-names = "activity";
+		activity-led-brightness = <75>;
 
 		clocks = <&camcc CAM_CC_MCLK4_CLK>;
 
