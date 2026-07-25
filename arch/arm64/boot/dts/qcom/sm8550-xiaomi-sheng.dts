@@ -1400,30 +1400,33 @@
 };
 
 &pm8550_pwm {
+	nvmem = <&pmk8550_sdam_21>, <&pmk8550_sdam_22>;
+	nvmem-names = "lpg_chan_sdam", "lut_sdam";
+
+	#address-cells = <1>;
+	#size-cells = <0>;
+
 	status = "okay";
 
-	multi-led {
-		color = <LED_COLOR_ID_RGB>;
+	led@1 {
+		reg = <1>;
 		function = LED_FUNCTION_STATUS;
+		color = <LED_COLOR_ID_RED>;
 		max-brightness = <255>;
+	};
 
-		#address-cells = <1>;
-		#size-cells = <0>;
+	green_led: led@2 {
+		reg = <2>;
+		function = LED_FUNCTION_INDICATOR;
+		color = <LED_COLOR_ID_GREEN>;
+		max-brightness = <255>;
+	};
 
-		led@1 {
-			reg = <1>;
-			color = <LED_COLOR_ID_RED>;
-		};
-
-		led@2 {
-			reg = <2>;
-			color = <LED_COLOR_ID_GREEN>;
-		};
-
-		led@3 {
-			reg = <3>;
-			color = <LED_COLOR_ID_BLUE>;
-		};
+	led@3 {
+		reg = <3>;
+		function = LED_FUNCTION_STATUS;
+		color = <LED_COLOR_ID_BLUE>;
+		max-brightness = <255>;
 	};
 };
 
