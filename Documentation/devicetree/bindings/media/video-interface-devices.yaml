@@ -23,7 +23,15 @@ properties:
 
   led-names:
     enum:
+      - activity
       - privacy
+
+  activity-led-brightness:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    description:
+      Brightness used for the activity LED while the video device is
+      streaming. The LED remains available for userspace control while active.
 
   lens-focus:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -404,6 +412,18 @@ properties:
         # External. The device is not attached directly to the system but is
         # attached in a way that allows it to move freely.
       - 2
+
+allOf:
+  - if:
+      required:
+        - activity-led-brightness
+    then:
+      properties:
+        led-names:
+          const: activity
+      required:
+        - leds
+        - led-names
 
 additionalProperties: true
 
