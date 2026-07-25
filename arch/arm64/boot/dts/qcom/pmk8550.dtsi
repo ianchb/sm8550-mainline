@@ -64,6 +64,22 @@
 			};
 		};
 
+		pmk8550_sdam_21: nvram@8400 {
+			compatible = "qcom,spmi-sdam";
+			reg = <0x8400>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0 0x8400 0x100>;
+		};
+
+		pmk8550_sdam_22: nvram@8500 {
+			compatible = "qcom,spmi-sdam";
+			reg = <0x8500>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0 0x8500 0x100>;
+		};
+
 		pmk8550_gpios: gpio@b800 {
 			compatible = "qcom,pmk8550-gpio", "qcom,spmi-gpio";
 			reg = <0xb800>;
