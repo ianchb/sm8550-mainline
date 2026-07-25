@@ -1274,6 +1274,10 @@ int __v4l2_async_register_subdev_sensor(struct v4l2_subdev *sd, struct module *m
 	if (ret < 0)
 		goto out_cleanup;
 
+	ret = v4l2_subdev_get_activity_led(sd);
+	if (ret < 0)
+		goto out_cleanup;
+
 	ret = v4l2_async_nf_parse_fwnode_sensor(sd->dev, notifier);
 	if (ret < 0)
 		goto out_cleanup;
@@ -1294,6 +1298,7 @@ out_unregister:
 	v4l2_async_nf_unregister(notifier);
 
 out_cleanup:
+	v4l2_subdev_put_activity_led(sd);
 	v4l2_subdev_put_privacy_led(sd);
 	v4l2_async_nf_cleanup(notifier);
 	kfree(notifier);

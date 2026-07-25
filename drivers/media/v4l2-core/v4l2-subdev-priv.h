@@ -10,5 +10,7 @@
 
 int v4l2_subdev_get_privacy_led(struct v4l2_subdev *sd);
 void v4l2_subdev_put_privacy_led(struct v4l2_subdev *sd);
+int v4l2_subdev_get_activity_led(struct v4l2_subdev *sd);
+void v4l2_subdev_put_activity_led(struct v4l2_subdev *sd);
 
 #endif

@@ -14,6 +14,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -170,20 +171,50 @@ static int subdev_close(struct file *file)
 }
 #endif /* CONFIG_VIDEO_V4L2_SUBDEV_API */
 
-static void v4l2_subdev_enable_privacy_led(struct v4l2_subdev *sd)
+#if IS_REACHABLE(CONFIG_LEDS_CLASS)
+struct v4l2_subdev_activity_led {
+	struct list_head list;
+	struct led_classdev *led;
+	unsigned int brightness;
+	unsigned int consumers;
+	unsigned int active;
+};
+
+static DEFINE_MUTEX(v4l2_subdev_activity_led_lock);
+static LIST_HEAD(v4l2_subdev_activity_leds);
+#endif
+
+static void v4l2_subdev_enable_leds(struct v4l2_subdev *sd)
 {
 #if IS_REACHABLE(CONFIG_LEDS_CLASS)
 	if (!IS_ERR_OR_NULL(sd->privacy_led))
 		led_set_brightness(sd->privacy_led,
 				   sd->privacy_led->max_brightness);
+
+	mutex_lock(&v4l2_subdev_activity_led_lock);
+	if (sd->activity_led_state && !sd->activity_led_enabled) {
+		sd->activity_led_enabled = true;
+		if (!sd->activity_led_state->active++)
+			led_set_brightness(sd->activity_led,
+					   sd->activity_led_state->brightness);
+	}
+	mutex_unlock(&v4l2_subdev_activity_led_lock);
 #endif
 }
 
-static void v4l2_subdev_disable_privacy_led(struct v4l2_subdev *sd)
+static void v4l2_subdev_disable_leds(struct v4l2_subdev *sd)
 {
 #if IS_REACHABLE(CONFIG_LEDS_CLASS)
 	if (!IS_ERR_OR_NULL(sd->privacy_led))
 		led_set_brightness(sd->privacy_led, 0);
+
+	mutex_lock(&v4l2_subdev_activity_led_lock);
+	if (sd->activity_led_state && sd->activity_led_enabled) {
+		sd->activity_led_enabled = false;
+		if (!--sd->activity_led_state->active)
+			led_set_brightness(sd->activity_led, 0);
+	}
+	mutex_unlock(&v4l2_subdev_activity_led_lock);
 #endif
 }
 
@@ -495,9 +526,9 @@ static int call_s_stream(struct v4l2_subdev *sd, int enable)
 		sd->s_stream_enabled = enable;
 
 		if (enable)
-			v4l2_subdev_enable_privacy_led(sd);
+			v4l2_subdev_enable_leds(sd);
 		else
-			v4l2_subdev_disable_privacy_led(sd);
+			v4l2_subdev_disable_leds(sd);
 	}
 
 	return ret;
@@ -2396,7 +2427,7 @@ int v4l2_subdev_enable_streams(struct v4l2_subdev *sd, u32 pad,
 	 * for all cases.
 	 */
 	if (!use_s_stream && !already_streaming)
-		v4l2_subdev_enable_privacy_led(sd);
+		v4l2_subdev_enable_leds(sd);
 
 done:
 	if (!use_s_stream)
@@ -2490,7 +2521,7 @@ int v4l2_subdev_disable_streams(struct v4l2_subdev *sd, u32 pad,
 done:
 	if (!use_s_stream) {
 		if (!v4l2_subdev_is_streaming(sd))
-			v4l2_subdev_disable_privacy_led(sd);
+			v4l2_subdev_disable_leds(sd);
 
 		v4l2_subdev_unlock_state(state);
 	}
@@ -2687,6 +2718,9 @@ void v4l2_subdev_init(struct v4l2_subdev *sd, const struct v4l2_subdev_ops *ops)
 	sd->dev_priv = NULL;
 	sd->host_priv = NULL;
 	sd->privacy_led = NULL;
+	sd->activity_led = NULL;
+	sd->activity_led_state = NULL;
+	sd->activity_led_enabled = false;
 	INIT_LIST_HEAD(&sd->async_subdev_endpoint_list);
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	sd->entity.name = sd->name;
@@ -2761,3 +2795,96 @@ void v4l2_subdev_put_privacy_led(struct v4l2_subdev *sd)
 #endif
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_put_privacy_led);
+
+int v4l2_subdev_get_activity_led(struct v4l2_subdev *sd)
+{
+#if IS_REACHABLE(CONFIG_LEDS_CLASS)
+	struct v4l2_subdev_activity_led *activity_led;
+	u32 brightness;
+
+	sd->activity_led = led_get(sd->dev, "activity");
+	if (IS_ERR(sd->activity_led)) {
+		if (PTR_ERR(sd->activity_led) == -ENOENT) {
+			sd->activity_led = NULL;
+			return 0;
+		}
+
+		return dev_err_probe(sd->dev, PTR_ERR(sd->activity_led),
+				     "getting activity LED\n");
+	}
+
+	brightness = sd->activity_led->max_brightness;
+	device_property_read_u32(sd->dev, "activity-led-brightness", &brightness);
+	if (!brightness || brightness > sd->activity_led->max_brightness) {
+		dev_err(sd->dev, "invalid activity LED brightness %u\n", brightness);
+		led_put(sd->activity_led);
+		sd->activity_led = NULL;
+		return -EINVAL;
+	}
+
+	mutex_lock(&v4l2_subdev_activity_led_lock);
+	list_for_each_entry(activity_led, &v4l2_subdev_activity_leds, list) {
+		if (activity_led->led != sd->activity_led)
+			continue;
+
+		if (activity_led->brightness != brightness) {
+			mutex_unlock(&v4l2_subdev_activity_led_lock);
+			dev_err(sd->dev, "conflicting activity LED brightness %u\n",
+				brightness);
+			led_put(sd->activity_led);
+			sd->activity_led = NULL;
+			return -EINVAL;
+		}
+
+		activity_led->consumers++;
+		sd->activity_led_state = activity_led;
+		mutex_unlock(&v4l2_subdev_activity_led_lock);
+		return 0;
+	}
+
+	activity_led = kzalloc_obj(*activity_led);
+	if (!activity_led) {
+		mutex_unlock(&v4l2_subdev_activity_led_lock);
+		led_put(sd->activity_led);
+		sd->activity_led = NULL;
+		return -ENOMEM;
+	}
+
+	activity_led->led = sd->activity_led;
+	activity_led->brightness = brightness;
+	activity_led->consumers = 1;
+	list_add(&activity_led->list, &v4l2_subdev_activity_leds);
+	sd->activity_led_state = activity_led;
+	mutex_unlock(&v4l2_subdev_activity_led_lock);
+#endif
+	return 0;
+}
+EXPORT_SYMBOL_GPL(v4l2_subdev_get_activity_led);
+
+void v4l2_subdev_put_activity_led(struct v4l2_subdev *sd)
+{
+#if IS_REACHABLE(CONFIG_LEDS_CLASS)
+	struct v4l2_subdev_activity_led *activity_led = sd->activity_led_state;
+
+	if (!activity_led)
+		return;
+
+	mutex_lock(&v4l2_subdev_activity_led_lock);
+	if (sd->activity_led_enabled) {
+		sd->activity_led_enabled = false;
+		if (!--activity_led->active)
+			led_set_brightness(sd->activity_led, 0);
+	}
+
+	if (!--activity_led->consumers) {
+		list_del(&activity_led->list);
+		kfree(activity_led);
+	}
+	sd->activity_led_state = NULL;
+	mutex_unlock(&v4l2_subdev_activity_led_lock);
+
+	led_put(sd->activity_led);
+	sd->activity_led = NULL;
+#endif
+}
+EXPORT_SYMBOL_GPL(v4l2_subdev_put_activity_led);
