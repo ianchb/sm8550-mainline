@@ -78,6 +78,10 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 int msm_dsi_host_power_off(struct mipi_dsi_host *host);
 int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 				  const struct drm_display_mode *mode);
+int msm_dsi_host_seamless_mode_set(struct mipi_dsi_host *host,
+				   const struct drm_display_mode *mode,
+				   bool is_bonded_dsi);
+int msm_dsi_host_timing_db_update(struct mipi_dsi_host *host, bool enable);
 enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,
 					    const struct drm_display_mode *mode);
 unsigned long msm_dsi_host_get_mode_flags(struct mipi_dsi_host *host);
@@ -124,6 +128,21 @@ void msm_dsi_host_test_pattern_en(struct mipi_dsi_host *host);
 struct drm_dsc_config *msm_dsi_host_get_dsc_config(struct mipi_dsi_host *host);
 bool msm_dsi_host_is_wide_bus_enabled(struct mipi_dsi_host *host);
 
+bool msm_dsi_manager_seamless_mode_valid(struct msm_dsi *msm_dsi,
+					 const struct drm_display_mode *old_mode,
+					 const struct drm_display_mode *new_mode);
+int msm_dsi_manager_seamless_mode_set(struct msm_dsi *msm_dsi,
+				      const struct drm_display_mode *old_mode,
+				      const struct drm_display_mode *new_mode);
+void msm_dsi_manager_seamless_begin(struct msm_dsi *msm_dsi);
+void msm_dsi_manager_seamless_pre_kickoff(struct msm_dsi *msm_dsi,
+					  const struct drm_display_mode *old_mode,
+					  const struct drm_display_mode *new_mode);
+void msm_dsi_manager_seamless_post_kickoff(struct msm_dsi *msm_dsi,
+					   const struct drm_display_mode *old_mode,
+					   const struct drm_display_mode *new_mode);
+void msm_dsi_manager_seamless_complete(struct msm_dsi *msm_dsi);
+
 /* dsi phy */
 struct msm_dsi_phy;
 struct msm_dsi_phy_shared_timings {
@@ -152,4 +171,3 @@ void msm_dsi_phy_snapshot(struct msm_disp_state *disp_state, struct msm_dsi_phy 
 bool msm_dsi_phy_set_continuous_clock(struct msm_dsi_phy *phy, bool enable);
 
 #endif /* __DSI_CONNECTOR_H__ */
-
