@@ -34,6 +34,7 @@ struct backlight_device;
 struct dentry;
 struct device_node;
 struct drm_connector;
+struct drm_display_mode;
 struct drm_panel_follower;
 struct drm_panel;
 struct display_timing;
@@ -137,6 +138,45 @@ struct drm_panel_funcs {
 	 */
 	int (*get_timings)(struct drm_panel *panel, unsigned int num_timings,
 			   struct display_timing *timings);
+
+	/**
+	 * @seamless_mode_valid:
+	 *
+	 * Check whether an active panel can switch directly between two modes.
+	 * This is intended for discrete, panel-specific timing changes and does
+	 * not advertise Adaptive-Sync support.
+	 */
+	bool (*seamless_mode_valid)(struct drm_panel *panel,
+				    const struct drm_display_mode *old_mode,
+				    const struct drm_display_mode *new_mode);
+
+	/**
+	 * @seamless_mode_begin:
+	 *
+	 * Begin a panel-specific seamless mode transaction before the display
+	 * controller waits for a safe scanout interval.
+	 */
+	void (*seamless_mode_begin)(struct drm_panel *panel);
+
+	/**
+	 * @seamless_mode_pre_kickoff:
+	 *
+	 * Issue panel commands which must precede the display-controller
+	 * kickoff for a seamless mode switch.
+	 */
+	int (*seamless_mode_pre_kickoff)(struct drm_panel *panel,
+					 const struct drm_display_mode *old_mode,
+					 const struct drm_display_mode *new_mode);
+
+	/**
+	 * @seamless_mode_post_kickoff:
+	 *
+	 * Issue panel commands which must follow the display-controller
+	 * kickoff for a seamless mode switch.
+	 */
+	int (*seamless_mode_post_kickoff)(struct drm_panel *panel,
+					  const struct drm_display_mode *old_mode,
+					  const struct drm_display_mode *new_mode);
 
 	/**
 	 * @debugfs_init:

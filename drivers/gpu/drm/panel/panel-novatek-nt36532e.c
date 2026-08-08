@@ -34,6 +34,7 @@ struct panel_info {
 
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data supplies[3];
+	struct mutex mode_lock;
 };
 
 struct panel_desc {
@@ -205,12 +206,11 @@ static int sheng_tianma_init_sequence(struct panel_info *pinfo)
 	if (cur_vrefresh == 120 || cur_vrefresh == 60) {
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb2, 0x91);//Framerate ctrl
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb3, 0x40);//Framerate ctrl2
-	}
-	else if (cur_vrefresh == 90 || cur_vrefresh == 30){
+	} else if (cur_vrefresh == 90 || cur_vrefresh == 50 ||
+		 cur_vrefresh == 48 || cur_vrefresh == 30) {
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb2, 0x00);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb3, 0x80);
-	}
-	else {
+	} else {
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb2, 0x00);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb3, 0x00);
 	}
@@ -272,6 +272,30 @@ static const struct drm_display_mode sheng_tianma_modes[] = {
 		.vsync_start = 2032 + 2224,
 		.vsync_end = 2032 + 2224 + 2,
 		.vtotal = 2032 + 2224 + 2 + 138,
+	},
+	{
+		/* 50Hz */
+		.clock = (3048 + 894 + 4 + 92) * (2032 + 26 + 2 + 138) * 90 / 1000,
+		.hdisplay = 3048,
+		.hsync_start = 3048 + 894,
+		.hsync_end = 3048 + 894 + 4,
+		.htotal = 3048 + 894 + 4 + 92,
+		.vdisplay = 2032,
+		.vsync_start = 2032 + 1784,
+		.vsync_end = 2032 + 1784 + 2,
+		.vtotal = 2032 + 1784 + 2 + 138,
+	},
+	{
+		/* 48Hz */
+		.clock = (3048 + 894 + 4 + 92) * (2032 + 26 + 2 + 138) * 90 / 1000,
+		.hdisplay = 3048,
+		.hsync_start = 3048 + 894,
+		.hsync_end = 3048 + 894 + 4,
+		.htotal = 3048 + 894 + 4 + 92,
+		.vdisplay = 2032,
+		.vsync_start = 2032 + 1949,
+		.vsync_end = 2032 + 1949 + 2,
+		.vtotal = 2032 + 1949 + 2 + 138,
 	},
 	{
 		/* 30Hz */
@@ -381,6 +405,7 @@ static int nt36532e_get_modes(struct drm_panel *panel,
 			       struct drm_connector *connector)
 {
 	struct panel_info *pinfo = to_panel_info(panel);
+	unsigned int max_vrefresh = 0;
 	int i;
 
 	for (i = 0; i < pinfo->desc->num_modes; i++) {
@@ -400,11 +425,14 @@ static int nt36532e_get_modes(struct drm_panel *panel,
 
 		drm_mode_set_name(mode);
 		drm_mode_probed_add(connector, mode);
+		max_vrefresh = max_t(unsigned int, max_vrefresh,
+				     drm_mode_vrefresh(m));
 	}
 
 	connector->display_info.width_mm = pinfo->desc->width_mm;
 	connector->display_info.height_mm = pinfo->desc->height_mm;
 	connector->display_info.bpc = pinfo->desc->bpc;
+	connector->display_info.monitor_range.max_vfreq = max_vrefresh;
 	pinfo->connector = connector;
 
 	return pinfo->desc->num_modes;
@@ -417,12 +445,129 @@ static enum drm_panel_orientation nt36532e_get_orientation(struct drm_panel *pan
 	return pinfo->orientation;
 }
 
+static bool nt36532e_is_factory_mode(struct panel_info *pinfo,
+				     const struct drm_display_mode *mode)
+{
+	int i;
+
+	for (i = 0; i < pinfo->desc->num_modes; i++)
+		if (drm_mode_match(mode, &pinfo->desc->modes[i],
+				   DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK |
+				   DRM_MODE_MATCH_FLAGS))
+			return true;
+
+	return false;
+}
+
+static bool nt36532e_seamless_mode_valid(struct drm_panel *panel,
+					 const struct drm_display_mode *old_mode,
+					 const struct drm_display_mode *new_mode)
+{
+	struct panel_info *pinfo = to_panel_info(panel);
+
+	return pinfo->desc == &sheng_tianma_desc &&
+	       !drm_mode_equal(old_mode, new_mode) &&
+	       old_mode->hdisplay == new_mode->hdisplay &&
+	       old_mode->vdisplay == new_mode->vdisplay &&
+	       nt36532e_is_factory_mode(pinfo, old_mode) &&
+	       nt36532e_is_factory_mode(pinfo, new_mode);
+}
+
+static void nt36532e_seamless_mode_begin(struct drm_panel *panel)
+{
+	struct panel_info *pinfo = to_panel_info(panel);
+
+	/* The factory holds panel_lock across both waits and the kickoff. */
+	mutex_lock(&pinfo->mode_lock);
+}
+
+static int nt36532e_seamless_mode_pre_kickoff(
+		struct drm_panel *panel,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode)
+{
+	struct panel_info *pinfo = to_panel_info(panel);
+	struct mipi_dsi_device *dsi = pinfo->dsi[0];
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+	unsigned long mode_flags;
+	u8 page_cmd[] = { 0xff, 0x10 };
+	u8 reload_cmd[] = { 0xfb, 0x01 };
+	u8 pen_cmd[] = { 0xb2, 0x80 };
+
+	if (drm_mode_vrefresh(old_mode) != 60 ||
+	    drm_mode_vrefresh(new_mode) == 120)
+		return 0;
+
+	mode_flags = dsi->mode_flags;
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	mipi_dsi_dcs_write_long_multi(&dsi_ctx, page_cmd,
+					ARRAY_SIZE(page_cmd),
+					MIPI_DSI_MSG_BATCH_COMMAND);
+	mipi_dsi_dcs_write_long_multi(&dsi_ctx, reload_cmd,
+					ARRAY_SIZE(reload_cmd),
+					MIPI_DSI_MSG_BATCH_COMMAND);
+	mipi_dsi_dcs_write_long_multi(&dsi_ctx, pen_cmd,
+					ARRAY_SIZE(pen_cmd), 0);
+	dsi->mode_flags = mode_flags;
+
+	return dsi_ctx.accum_err;
+}
+
+static int nt36532e_seamless_mode_post_kickoff(
+		struct drm_panel *panel,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode)
+{
+	struct panel_info *pinfo = to_panel_info(panel);
+	struct mipi_dsi_device *dsi = pinfo->dsi[0];
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+	unsigned long mode_flags;
+	int vrefresh = drm_mode_vrefresh(new_mode);
+	u8 b2, b3;
+	u8 page_cmd[] = { 0xff, 0x10 };
+	u8 b2_cmd[] = { 0xb2, 0 };
+	u8 b3_cmd[] = { 0xb3, 0 };
+
+	if (vrefresh == 120 || vrefresh == 60) {
+		b2 = 0x91;
+		b3 = 0x40;
+	} else if (vrefresh == 90 || vrefresh == 50 ||
+		   vrefresh == 48 || vrefresh == 30) {
+		b2 = 0x00;
+		b3 = 0x80;
+	} else {
+		b2 = 0x00;
+		b3 = 0x00;
+	}
+
+	mode_flags = dsi->mode_flags;
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	mipi_dsi_dcs_write_long_multi(&dsi_ctx, page_cmd,
+					ARRAY_SIZE(page_cmd),
+					MIPI_DSI_MSG_BATCH_COMMAND);
+	b2_cmd[1] = b2;
+	b3_cmd[1] = b3;
+	mipi_dsi_dcs_write_long_multi(&dsi_ctx, b2_cmd,
+					ARRAY_SIZE(b2_cmd),
+					MIPI_DSI_MSG_BATCH_COMMAND);
+	mipi_dsi_dcs_write_long_multi(&dsi_ctx, b3_cmd,
+					ARRAY_SIZE(b3_cmd), 0);
+	dsi->mode_flags = mode_flags;
+	mutex_unlock(&pinfo->mode_lock);
+
+	return dsi_ctx.accum_err;
+}
+
 static const struct drm_panel_funcs nt36532e_panel_funcs = {
 	.disable = nt36532e_disable,
 	.prepare = nt36532e_prepare,
 	.unprepare = nt36532e_unprepare,
 	.get_modes = nt36532e_get_modes,
 	.get_orientation = nt36532e_get_orientation,
+	.seamless_mode_valid = nt36532e_seamless_mode_valid,
+	.seamless_mode_begin = nt36532e_seamless_mode_begin,
+	.seamless_mode_pre_kickoff = nt36532e_seamless_mode_pre_kickoff,
+	.seamless_mode_post_kickoff = nt36532e_seamless_mode_post_kickoff,
 };
 
 static int nt36532e_probe(struct mipi_dsi_device *dsi)
@@ -439,6 +584,8 @@ static int nt36532e_probe(struct mipi_dsi_device *dsi)
 				     DRM_MODE_CONNECTOR_DSI);
 	if (IS_ERR(pinfo))
 		return PTR_ERR(pinfo);
+
+	mutex_init(&pinfo->mode_lock);
 
 	pinfo->supplies[0].supply = "vddio";
 	pinfo->supplies[1].supply = "avdd";

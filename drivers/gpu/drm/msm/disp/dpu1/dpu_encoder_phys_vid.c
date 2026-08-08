@@ -30,6 +30,9 @@
 #define to_dpu_encoder_phys_vid(x) \
 	container_of(x, struct dpu_encoder_phys_vid, base)
 
+static bool dpu_encoder_phys_vid_needs_single_flush(
+		struct dpu_encoder_phys *phys_enc);
+
 static bool dpu_encoder_phys_vid_is_master(
 		struct dpu_encoder_phys *phys_enc)
 {
@@ -159,6 +162,17 @@ static u32 get_vertical_total(const struct dpu_hw_intf_timing_params *timing)
 	return active + inactive;
 }
 
+static bool programmable_fetch_is_kalama_dsi(
+		const struct dpu_encoder_phys *phys_enc)
+{
+	const struct dpu_mdss_version *mdss_ver =
+		phys_enc->dpu_kms->catalog->mdss_ver;
+
+	return phys_enc->hw_intf->cap->type == INTF_DSI &&
+		mdss_ver->core_major_ver == 9 &&
+		mdss_ver->core_minor_ver == 0;
+}
+
 /*
  * programmable_fetch_get_num_lines:
  *	Number of fetch lines in vertical front porch
@@ -175,35 +189,49 @@ static u32 get_vertical_total(const struct dpu_hw_intf_timing_params *timing)
  */
 static u32 programmable_fetch_get_num_lines(
 		struct dpu_encoder_phys *phys_enc,
-		const struct dpu_hw_intf_timing_params *timing)
+		const struct dpu_hw_intf_timing_params *timing,
+		u32 vrefresh)
 {
 	u32 worst_case_needed_lines =
 	    phys_enc->hw_intf->cap->prog_fetch_lines_worst_case;
 	u32 start_of_frame_lines =
 	    timing->v_back_porch + timing->vsync_pulse_width;
-	u32 needed_vfp_lines = worst_case_needed_lines - start_of_frame_lines;
+	u32 needed_vfp_lines = 0;
 	u32 actual_vfp_lines = 0;
+	bool kalama_dsi = programmable_fetch_is_kalama_dsi(phys_enc);
+
+	if (kalama_dsi) {
+		worst_case_needed_lines = 40;
+		if (vrefresh > 60)
+			worst_case_needed_lines =
+				vrefresh * worst_case_needed_lines / 60;
+	}
 
 	/* Fetch must be outside active lines, otherwise undefined. */
 	if (start_of_frame_lines >= worst_case_needed_lines) {
 		DPU_DEBUG_VIDENC(phys_enc,
-				"prog fetch is not needed, large vbp+vsw\n");
-		actual_vfp_lines = 0;
-	} else if (timing->v_front_porch < needed_vfp_lines) {
-		/* Warn fetch needed, but not enough porch in panel config */
-		pr_warn_once
-			("low vbp+vfp may lead to perf issues in some cases\n");
-		DPU_DEBUG_VIDENC(phys_enc,
-				"less vfp than fetch req, using entire vfp\n");
-		actual_vfp_lines = timing->v_front_porch;
+				"prog fetch always enabled case\n");
+		actual_vfp_lines = kalama_dsi ? 2 : 0;
 	} else {
-		DPU_DEBUG_VIDENC(phys_enc, "room in vfp for needed prefetch\n");
-		actual_vfp_lines = needed_vfp_lines;
+		needed_vfp_lines = worst_case_needed_lines -
+			start_of_frame_lines;
+		if (timing->v_front_porch < needed_vfp_lines) {
+			/* Warn fetch needed, but not enough porch in panel config */
+			pr_warn_once
+				("low vbp+vfp may lead to perf issues in some cases\n");
+			DPU_DEBUG_VIDENC(phys_enc,
+					"less vfp than fetch req, using entire vfp\n");
+			actual_vfp_lines = timing->v_front_porch;
+		} else {
+			DPU_DEBUG_VIDENC(phys_enc,
+					"room in vfp for needed prefetch\n");
+			actual_vfp_lines = needed_vfp_lines;
+		}
 	}
 
 	DPU_DEBUG_VIDENC(phys_enc,
-		"v_front_porch %u v_back_porch %u vsync_pulse_width %u\n",
-		timing->v_front_porch, timing->v_back_porch,
+		"vrefresh %u v_front_porch %u v_back_porch %u vsync_pulse_width %u\n",
+		vrefresh, timing->v_front_porch, timing->v_back_porch,
 		timing->vsync_pulse_width);
 	DPU_DEBUG_VIDENC(phys_enc,
 		"wc_lines %u needed_vfp_lines %u actual_vfp_lines %u\n",
@@ -223,9 +251,13 @@ static u32 programmable_fetch_get_num_lines(
  * @timing: Pointer to the intf timing information for the requested mode
  */
 static void programmable_fetch_config(struct dpu_encoder_phys *phys_enc,
-				      const struct dpu_hw_intf_timing_params *timing)
+				      const struct dpu_hw_intf_timing_params *timing,
+				      u32 intf_vrefresh)
 {
 	struct dpu_hw_intf_prog_fetch f = { 0 };
+	bool kalama_dsi = programmable_fetch_is_kalama_dsi(phys_enc);
+	u32 max_vrefresh = 0;
+	u32 vrefresh = intf_vrefresh;
 	u32 vfp_fetch_lines = 0;
 	u32 horiz_total = 0;
 	u32 vert_total = 0;
@@ -235,12 +267,20 @@ static void programmable_fetch_config(struct dpu_encoder_phys *phys_enc,
 	if (WARN_ON_ONCE(!phys_enc->hw_intf->ops.setup_prg_fetch))
 		return;
 
-	vfp_fetch_lines = programmable_fetch_get_num_lines(phys_enc, timing);
+	if (kalama_dsi) {
+		max_vrefresh = dpu_encoder_get_max_vrefresh(phys_enc->parent);
+		vrefresh = max(vrefresh, max_vrefresh);
+	}
+
+	vfp_fetch_lines = programmable_fetch_get_num_lines(phys_enc, timing,
+						     vrefresh);
 	if (vfp_fetch_lines) {
 		vert_total = get_vertical_total(timing);
 		horiz_total = get_horizontal_total(timing);
 		vfp_fetch_start_vsync_counter =
 		    (vert_total - vfp_fetch_lines) * horiz_total + 1;
+		if (kalama_dsi)
+			vfp_fetch_start_vsync_counter += horiz_total;
 		f.enable = 1;
 		f.fetch_start = vfp_fetch_start_vsync_counter;
 	}
@@ -329,7 +369,32 @@ static void dpu_encoder_phys_vid_setup_timing_engine(
 
 	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
 
-	programmable_fetch_config(phys_enc, &timing_params);
+	programmable_fetch_config(phys_enc, &timing_params,
+				  drm_mode_vrefresh(&mode));
+}
+
+static void dpu_encoder_phys_vid_prepare_seamless_mode(
+		struct dpu_encoder_phys *phys_enc,
+		struct drm_crtc_state *crtc_state)
+{
+	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
+	bool single_flush;
+
+	if (phys_enc->enable_state != DPU_ENC_ENABLED || !ctl)
+		return;
+
+	phys_enc->cached_mode = crtc_state->adjusted_mode;
+	dpu_encoder_phys_vid_setup_timing_engine(phys_enc);
+
+	single_flush = dpu_encoder_phys_vid_needs_single_flush(phys_enc);
+	if (!single_flush || dpu_encoder_phys_vid_is_master(phys_enc)) {
+		ctl->ops.update_pending_flush_intf(ctl,
+						   phys_enc->hw_intf->idx);
+		if (ctl->ops.update_pending_flush_merge_3d &&
+		    phys_enc->hw_pp->merge_3d)
+			ctl->ops.update_pending_flush_merge_3d(ctl,
+						phys_enc->hw_pp->merge_3d->idx);
+	}
 }
 
 static void dpu_encoder_phys_vid_vblank_irq(void *arg)
@@ -379,6 +444,10 @@ static void dpu_encoder_phys_vid_underrun_irq(void *arg)
 static bool dpu_encoder_phys_vid_needs_single_flush(
 		struct dpu_encoder_phys *phys_enc)
 {
+	if (phys_enc->parent && phys_enc->parent->crtc &&
+	    to_dpu_crtc_state(phys_enc->parent->crtc->state)->seamless_mode_prepared)
+		return true;
+
 	return !(phys_enc->dpu_kms->catalog->mdss_ver->core_major_ver >= 5) &&
 		phys_enc->split_role != ENC_ROLE_SOLO;
 }
@@ -740,6 +809,7 @@ static void dpu_encoder_phys_vid_init_ops(struct dpu_encoder_phys_ops *ops)
 {
 	ops->is_master = dpu_encoder_phys_vid_is_master;
 	ops->atomic_mode_set = dpu_encoder_phys_vid_atomic_mode_set;
+	ops->prepare_seamless_mode = dpu_encoder_phys_vid_prepare_seamless_mode;
 	ops->enable = dpu_encoder_phys_vid_enable;
 	ops->disable = dpu_encoder_phys_vid_disable;
 	ops->control_vblank_irq = dpu_encoder_phys_vid_control_vblank_irq;

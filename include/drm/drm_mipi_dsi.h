@@ -20,6 +20,8 @@ struct drm_dsc_picture_parameter_set;
 #define MIPI_DSI_MSG_REQ_ACK	BIT(0)
 /* use Low Power Mode to transmit message */
 #define MIPI_DSI_MSG_USE_LPM	BIT(1)
+/* queue command packet until a message without this flag is transferred */
+#define MIPI_DSI_MSG_BATCH_COMMAND	BIT(6)
 
 /**
  * struct mipi_dsi_msg - read/write DSI buffer
@@ -339,6 +341,8 @@ int mipi_dsi_dcs_write_buffer_chatty(struct mipi_dsi_device *dsi,
 				     const void *data, size_t len);
 void mipi_dsi_dcs_write_buffer_multi(struct mipi_dsi_multi_context *ctx,
 				     const void *data, size_t len);
+void mipi_dsi_dcs_write_long_multi(struct mipi_dsi_multi_context *ctx,
+				   const void *data, size_t len, u16 flags);
 void mipi_dsi_dual_dcs_write_buffer_multi(struct mipi_dsi_multi_context *ctx,
 					  struct mipi_dsi_device *dsi1,
 					  struct mipi_dsi_device *dsi2,
