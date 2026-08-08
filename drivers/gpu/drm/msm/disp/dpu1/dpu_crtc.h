@@ -207,6 +207,9 @@ struct dpu_crtc {
  */
 struct dpu_crtc_state {
 	struct drm_crtc_state base;
+	bool seamless_mode_changed;
+	bool seamless_mode_prepared;
+	struct drm_display_mode seamless_old_mode;
 
 	bool bw_control;
 	bool bw_split_vote;

@@ -462,17 +462,118 @@ static int dpu_kms_check_mode_changed(struct msm_kms *kms, struct drm_atomic_com
 	return 0;
 }
 
+static int dpu_kms_check_seamless_mode_changed(struct msm_kms *kms,
+					       struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
+				      new_crtc_state, i) {
+		struct dpu_crtc_state *cstate = to_dpu_crtc_state(new_crtc_state);
+		struct drm_encoder *encoder;
+		bool valid = true;
+		int num_encoders = 0;
+
+		cstate->seamless_mode_changed = false;
+		cstate->seamless_mode_prepared = false;
+
+		if (!new_crtc_state->mode_changed ||
+		    new_crtc_state->active_changed ||
+		    new_crtc_state->connectors_changed ||
+		    new_crtc_state->color_mgmt_changed ||
+		    !old_crtc_state->active || !new_crtc_state->active ||
+		    old_crtc_state->encoder_mask != new_crtc_state->encoder_mask ||
+		    drm_mode_equal(&old_crtc_state->mode, &new_crtc_state->mode))
+			continue;
+
+		drm_for_each_encoder_mask(encoder, crtc->dev,
+					  new_crtc_state->encoder_mask) {
+			num_encoders++;
+			if (!dpu_encoder_seamless_mode_valid(encoder,
+							     &old_crtc_state->adjusted_mode,
+							     &new_crtc_state->adjusted_mode)) {
+				valid = false;
+				break;
+			}
+		}
+
+		if (!valid || num_encoders != 1)
+			continue;
+
+		cstate->seamless_mode_changed = true;
+		/* A panel timing transaction must never take the async path. */
+		state->legacy_cursor_update = false;
+		state->async_update = false;
+		drm_mode_copy(&cstate->seamless_old_mode,
+			      &old_crtc_state->adjusted_mode);
+		new_crtc_state->mode_changed = false;
+	}
+
+	return 0;
+}
+
+static void dpu_kms_prepare_commit(struct msm_kms *kms,
+				   struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+		struct dpu_crtc_state *cstate = to_dpu_crtc_state(new_crtc_state);
+		struct drm_encoder *encoder;
+
+		if (!cstate->seamless_mode_changed || new_crtc_state->mode_changed)
+			continue;
+
+		drm_for_each_encoder_mask(encoder, crtc->dev,
+					  new_crtc_state->encoder_mask) {
+			int ret = dpu_encoder_prepare_seamless_mode(
+				encoder, new_crtc_state, &cstate->seamless_old_mode);
+
+			if (ret) {
+				DPU_ERROR("failed to prepare seamless mode on encoder %u: %d\n",
+					  encoder->base.id, ret);
+				cstate->seamless_mode_changed = false;
+				break;
+			}
+
+			cstate->seamless_mode_prepared = true;
+		}
+	}
+}
+
 static void dpu_kms_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
 {
 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
 	struct drm_crtc *crtc;
 
 	for_each_crtc_mask(dpu_kms->dev, crtc, crtc_mask) {
+		struct dpu_crtc_state *cstate = to_dpu_crtc_state(crtc->state);
+		struct drm_encoder *encoder;
+
 		if (!crtc->state->active)
 			continue;
 
+		if (cstate->seamless_mode_prepared) {
+			drm_for_each_encoder_mask(encoder, crtc->dev,
+						  crtc->state->encoder_mask)
+				dpu_encoder_seamless_pre_kickoff(encoder,
+						&cstate->seamless_old_mode,
+						&crtc->state->adjusted_mode);
+		}
+
 		trace_dpu_kms_commit(DRMID(crtc));
 		dpu_crtc_commit_kickoff(crtc);
+
+		if (cstate->seamless_mode_prepared) {
+			drm_for_each_encoder_mask(encoder, crtc->dev,
+						  crtc->state->encoder_mask)
+				dpu_encoder_complete_seamless_mode(encoder);
+			cstate->seamless_mode_prepared = false;
+		}
 	}
 }
 
@@ -1075,6 +1176,8 @@ static const struct msm_kms_funcs kms_funcs = {
 	.enable_commit   = dpu_kms_enable_commit,
 	.disable_commit  = dpu_kms_disable_commit,
 	.check_mode_changed = dpu_kms_check_mode_changed,
+	.check_seamless_mode_changed = dpu_kms_check_seamless_mode_changed,
+	.prepare_commit   = dpu_kms_prepare_commit,
 	.flush_commit    = dpu_kms_flush_commit,
 	.wait_flush      = dpu_kms_wait_flush,
 	.complete_commit = dpu_kms_complete_commit,

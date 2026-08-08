@@ -17,6 +17,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_vblank.h>
 
 #include "msm_drv.h"
 #include "dpu_kms.h"
@@ -34,6 +35,7 @@
 #include "dpu_crtc.h"
 #include "dpu_trace.h"
 #include "dpu_core_irq.h"
+#include "dsi/dsi.h"
 #include "disp/msm_disp_snapshot.h"
 
 #define DPU_DEBUG_ENC(e, fmt, ...) DRM_DEBUG_ATOMIC("enc%d " fmt,\
@@ -62,6 +64,11 @@
 
 /* timeout in frames waiting for frame done */
 #define DPU_ENCODER_FRAME_DONE_TIMEOUT_FRAMES 5
+
+static void dpu_encoder_seamless_kickoff_pre(
+		struct drm_encoder *drm_enc,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode);
 
 /**
  * enum dpu_enc_rc_events - events for resource control state machine
@@ -2156,10 +2163,24 @@ void dpu_encoder_kickoff(struct drm_encoder *drm_enc)
 {
 	struct dpu_encoder_virt *dpu_enc;
 	struct dpu_encoder_phys *phys;
+	const struct drm_display_mode *old_mode = NULL;
+	const struct drm_display_mode *new_mode = NULL;
+	bool seamless = false;
 	unsigned int i;
 
 	DPU_ATRACE_BEGIN("encoder_kickoff");
 	dpu_enc = to_dpu_encoder_virt(drm_enc);
+	if (drm_enc->crtc) {
+		struct dpu_crtc_state *cstate =
+			to_dpu_crtc_state(drm_enc->crtc->state);
+
+		seamless = cstate->seamless_mode_prepared;
+		if (seamless) {
+			old_mode = &cstate->seamless_old_mode;
+			new_mode = &drm_enc->crtc->state->adjusted_mode;
+			dpu_encoder_seamless_kickoff_pre(drm_enc, old_mode, new_mode);
+		}
+	}
 
 	trace_dpu_enc_kickoff(DRMID(drm_enc));
 
@@ -2173,7 +2194,178 @@ void dpu_encoder_kickoff(struct drm_encoder *drm_enc)
 			phys->ops.handle_post_kickoff(phys);
 	}
 
+	/* The factory sends the panel command after the physical hooks. */
+	if (seamless)
+		dpu_encoder_seamless_post_kickoff(drm_enc, old_mode, new_mode);
+
 	DPU_ATRACE_END("encoder_kickoff");
+}
+
+static struct msm_dsi *dpu_encoder_get_dsi(struct drm_encoder *drm_enc)
+{
+	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+	struct msm_drm_private *priv = drm_enc->dev->dev_private;
+
+	if (dpu_enc->disp_info.intf_type != INTF_DSI ||
+	    dpu_enc->disp_info.num_of_h_tiles < 1)
+		return NULL;
+
+	return priv->kms->dsi[dpu_enc->disp_info.h_tile_instance[0]];
+}
+
+unsigned int dpu_encoder_get_max_vrefresh(const struct drm_encoder *drm_enc)
+{
+	const struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+
+	if (!dpu_enc->connector)
+		return 0;
+
+	return dpu_enc->connector->display_info.monitor_range.max_vfreq;
+}
+
+static int dpu_encoder_seamless_wait_for_active(
+		struct drm_encoder *drm_enc,
+		const struct drm_display_mode *mode)
+{
+	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+	int i;
+
+	for (i = 0; i < dpu_enc->num_phys_encs; i++) {
+		struct dpu_encoder_phys *phys = dpu_enc->phys_encs[i];
+		int active_start, active_end, line, retry;
+
+		if (!phys->ops.get_line_count)
+			continue;
+
+		active_start = mode->vtotal - 2 * mode->vsync_start +
+			mode->vsync_end;
+		/* Match the factory's cached vdisplay-based active window. */
+		active_end = active_start + mode->vdisplay - mode->vdisplay / 4;
+
+		line = phys->ops.get_line_count(phys);
+		/* Slave video encoders have no independently readable line count. */
+		if (line < 0)
+			continue;
+
+		for (retry = 0; retry < 15; retry++) {
+			if (line > active_start && line < active_end)
+				break;
+			udelay(2000);
+			line = phys->ops.get_line_count(phys);
+		}
+
+		if (retry == 15)
+			return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+static int dpu_encoder_seamless_wait_for_vblank_active(
+		struct drm_encoder *drm_enc,
+		const struct drm_display_mode *mode)
+{
+	int ret;
+
+	if (!drm_enc->crtc)
+		return -EINVAL;
+
+	ret = drm_crtc_wait_one_vblank(drm_enc->crtc);
+	if (ret)
+		return ret;
+
+	return dpu_encoder_seamless_wait_for_active(drm_enc, mode);
+}
+
+static void dpu_encoder_seamless_kickoff_pre(
+		struct drm_encoder *drm_enc,
+		const struct drm_display_mode *old_mode,
+		const struct drm_display_mode *new_mode)
+{
+	struct msm_dsi *msm_dsi = dpu_encoder_get_dsi(drm_enc);
+	int ret;
+
+	msm_dsi_manager_seamless_begin(msm_dsi);
+
+	ret = dpu_encoder_seamless_wait_for_active(drm_enc, old_mode);
+	if (ret)
+		DPU_ERROR("failed to wait for video active: %d\n", ret);
+
+	msm_dsi_manager_seamless_pre_kickoff(msm_dsi, old_mode, new_mode);
+
+	/* N81A's 60Hz pre-command is followed by a vblank/active wait. */
+	if (drm_mode_vrefresh(old_mode) == 60 &&
+	    drm_mode_vrefresh(new_mode) != 120) {
+		ret = dpu_encoder_seamless_wait_for_vblank_active(drm_enc, old_mode);
+		if (ret)
+			DPU_ERROR("failed to wait for video active: %d\n", ret);
+	}
+}
+
+bool dpu_encoder_seamless_mode_valid(struct drm_encoder *drm_enc,
+				     const struct drm_display_mode *old_mode,
+				     const struct drm_display_mode *new_mode)
+{
+	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+	struct msm_dsi *msm_dsi = dpu_encoder_get_dsi(drm_enc);
+
+	if (!msm_dsi || dpu_enc->disp_info.is_cmd_mode)
+		return false;
+
+	return msm_dsi_manager_seamless_mode_valid(msm_dsi, old_mode, new_mode);
+}
+
+int dpu_encoder_prepare_seamless_mode(struct drm_encoder *drm_enc,
+				      struct drm_crtc_state *crtc_state,
+				      const struct drm_display_mode *old_mode)
+{
+	struct msm_dsi *msm_dsi = dpu_encoder_get_dsi(drm_enc);
+
+	if (!msm_dsi)
+		return -EINVAL;
+
+	return msm_dsi_manager_seamless_mode_set(msm_dsi, old_mode,
+						 &crtc_state->adjusted_mode);
+}
+
+void dpu_encoder_seamless_pre_kickoff(struct drm_encoder *drm_enc,
+				      const struct drm_display_mode *old_mode,
+				      const struct drm_display_mode *new_mode)
+{
+	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+	struct msm_dsi *msm_dsi = dpu_encoder_get_dsi(drm_enc);
+	int i;
+
+	if (!msm_dsi || !drm_enc->crtc)
+		return;
+
+	/* atomic_begin() has now cleared the previous CTL flush masks. */
+	for (i = 0; i < dpu_enc->num_phys_encs; i++) {
+		struct dpu_encoder_phys *phys = dpu_enc->phys_encs[i];
+
+		if (phys->ops.prepare_seamless_mode)
+			phys->ops.prepare_seamless_mode(phys,
+							drm_enc->crtc->state);
+	}
+
+}
+
+void dpu_encoder_seamless_post_kickoff(struct drm_encoder *drm_enc,
+				       const struct drm_display_mode *old_mode,
+				       const struct drm_display_mode *new_mode)
+{
+	struct msm_dsi *msm_dsi = dpu_encoder_get_dsi(drm_enc);
+
+	if (msm_dsi)
+		msm_dsi_manager_seamless_post_kickoff(msm_dsi, old_mode, new_mode);
+}
+
+void dpu_encoder_complete_seamless_mode(struct drm_encoder *drm_enc)
+{
+	struct msm_dsi *msm_dsi = dpu_encoder_get_dsi(drm_enc);
+
+	if (msm_dsi)
+		msm_dsi_manager_seamless_complete(msm_dsi);
 }
 
 static void dpu_encoder_helper_reset_mixers(struct dpu_encoder_phys *phys_enc)

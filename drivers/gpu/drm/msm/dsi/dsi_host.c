@@ -159,6 +159,7 @@ struct msm_dsi_host {
 	dma_addr_t tx_buf_paddr;
 
 	int tx_size;
+	int tx_batch_len;
 
 	u8 *rx_buf;
 
@@ -979,9 +980,10 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
 	}
 }
 
-static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
+static void dsi_timing_setup(struct msm_dsi_host *msm_host,
+			     const struct drm_display_mode *mode,
+			     bool is_bonded_dsi)
 {
-	struct drm_display_mode *mode = msm_host->mode;
 	u32 hs_start = 0, vs_start = 0; /* take sync start as 0 */
 	u32 h_total = mode->htotal;
 	u32 v_total = mode->vtotal;
@@ -1309,7 +1311,7 @@ void dsi_tx_buf_put_6g(struct msm_dsi_host *msm_host)
  * prepare cmd buffer to be txed
  */
 static int dsi_cmd_dma_add(struct msm_dsi_host *msm_host,
-			   const struct mipi_dsi_msg *msg)
+			   const struct mipi_dsi_msg *msg, int offset)
 {
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
 	struct mipi_dsi_packet packet;
@@ -1324,7 +1326,7 @@ static int dsi_cmd_dma_add(struct msm_dsi_host *msm_host,
 	}
 	len = (packet.size + 3) & (~0x3);
 
-	if (len > msm_host->tx_size) {
+	if (offset > msm_host->tx_size - len) {
 		pr_err("%s: packet size is too big\n", __func__);
 		return -EINVAL;
 	}
@@ -1336,11 +1338,15 @@ static int dsi_cmd_dma_add(struct msm_dsi_host *msm_host,
 		return ret;
 	}
 
+	data += offset;
+
 	/* MSM specific command format in memory */
 	data[0] = packet.header[1];
 	data[1] = packet.header[2];
 	data[2] = packet.header[0];
-	data[3] = BIT(7); /* Last packet */
+	data[3] = 0;
+	if (!(msg->flags & MIPI_DSI_MSG_BATCH_COMMAND))
+		data[3] |= BIT(7); /* Last packet */
 	if (mipi_dsi_packet_format_is_long(msg->type))
 		data[3] |= BIT(6);
 	if (msg->rx_buf && msg->rx_len)
@@ -1511,16 +1517,27 @@ static int dsi_cmd_dma_rx(struct msm_dsi_host *msm_host,
 static int dsi_cmds2buf_tx(struct msm_dsi_host *msm_host,
 				const struct mipi_dsi_msg *msg)
 {
-	int len, ret;
+	bool batched = msm_host->tx_batch_len ||
+		       (msg->flags & MIPI_DSI_MSG_BATCH_COMMAND);
+	int len, ret, total_len;
 	int bllp_len = msm_host->mode->hdisplay *
 			mipi_dsi_pixel_format_to_bpp(msm_host->format) / 8;
 
-	len = dsi_cmd_dma_add(msm_host, msg);
+	len = dsi_cmd_dma_add(msm_host, msg, msm_host->tx_batch_len);
 	if (len < 0) {
 		pr_err("%s: failed to add cmd type = 0x%x\n",
 			__func__,  msg->type);
+		msm_host->tx_batch_len = 0;
 		return len;
 	}
+	total_len = msm_host->tx_batch_len + len;
+
+	if (msg->flags & MIPI_DSI_MSG_BATCH_COMMAND) {
+		msm_host->tx_batch_len = total_len;
+		return msg->tx_len;
+	}
+
+	msm_host->tx_batch_len = 0;
 
 	/*
 	 * for video mode, do not send cmds more than
@@ -1532,24 +1549,27 @@ static int dsi_cmds2buf_tx(struct msm_dsi_host *msm_host,
 	 * actively streaming, we need to check more carefully if the
 	 * command can be fit into one BLLP.
 	 */
-	if ((msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) && (len > bllp_len)) {
+	if ((msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) &&
+	    (total_len > bllp_len)) {
 		pr_err("%s: cmd cannot fit into BLLP period, len=%d\n",
-			__func__, len);
+			__func__, total_len);
 		return -EINVAL;
 	}
 
-	ret = dsi_cmd_dma_tx(msm_host, len);
+	ret = dsi_cmd_dma_tx(msm_host, total_len);
 	if (ret < 0) {
 		pr_err("%s: cmd dma tx failed, type=0x%x, data0=0x%x, len=%d, ret=%d\n",
-			__func__, msg->type, (*(u8 *)(msg->tx_buf)), len, ret);
+			__func__, msg->type, (*(u8 *)(msg->tx_buf)),
+			total_len, ret);
 		return ret;
-	} else if (ret < len) {
+	} else if (ret < total_len) {
 		pr_err("%s: cmd dma tx failed, type=0x%x, data0=0x%x, ret=%d len=%d\n",
-			__func__, msg->type, (*(u8 *)(msg->tx_buf)), ret, len);
+			__func__, msg->type, (*(u8 *)(msg->tx_buf)), ret,
+			total_len);
 		return -EIO;
 	}
 
-	return len;
+	return batched ? msg->tx_len : len;
 }
 
 static void dsi_err_worker(struct work_struct *work)
@@ -2516,7 +2536,7 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		goto fail_disable_clk;
 	}
 
-	dsi_timing_setup(msm_host, is_bonded_dsi);
+	dsi_timing_setup(msm_host, msm_host->mode, is_bonded_dsi);
 	dsi_sw_reset(msm_host);
 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
 
@@ -2585,6 +2605,58 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 	}
 
 	return 0;
+}
+
+int msm_dsi_host_seamless_mode_set(struct mipi_dsi_host *host,
+				   const struct drm_display_mode *mode,
+				   bool is_bonded_dsi)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	int ret = 0;
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (!msm_host->power_on || !msm_host->enabled ||
+	    !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) || !msm_host->mode) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, 1);
+	/* Ensure timing DB is enabled before updating the shadow registers. */
+	wmb();
+	dsi_timing_setup(msm_host, mode, is_bonded_dsi);
+	/* The downstream timing helper flushes each host immediately. */
+	dsi_write(msm_host, REG_DSI_TIMING_FLUSH, 1);
+	drm_mode_copy(msm_host->mode, mode);
+
+out_unlock:
+	mutex_unlock(&msm_host->dev_mutex);
+
+	return ret;
+}
+
+int msm_dsi_host_timing_db_update(struct mipi_dsi_host *host, bool enable)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	int ret = 0;
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (!msm_host->power_on || !msm_host->enabled ||
+	    !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO)) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (!enable)
+		usleep_range(2000, 2010);
+	dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, enable);
+	/* Complete the timing DB transition before returning to the panel path. */
+	wmb();
+
+out_unlock:
+	mutex_unlock(&msm_host->dev_mutex);
+
+	return ret;
 }
 
 enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,

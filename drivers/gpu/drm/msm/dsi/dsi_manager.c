@@ -4,6 +4,7 @@
  */
 
 #include "drm/drm_bridge_connector.h"
+#include <drm/drm_panel.h>
 
 #include "msm_kms.h"
 #include "dsi.h"
@@ -451,6 +452,130 @@ static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
 	.mode_set = dsi_mgr_bridge_mode_set,
 	.mode_valid = dsi_mgr_bridge_mode_valid,
 };
+
+static struct drm_panel *dsi_mgr_get_panel(struct msm_dsi *msm_dsi)
+{
+	if (!msm_dsi || !msm_dsi->next_bridge)
+		return NULL;
+
+	return drm_panel_bridge_get_panel(msm_dsi->next_bridge);
+}
+
+bool msm_dsi_manager_seamless_mode_valid(struct msm_dsi *msm_dsi,
+					 const struct drm_display_mode *old_mode,
+					 const struct drm_display_mode *new_mode)
+{
+	struct msm_dsi *other_dsi;
+	struct drm_panel *panel = dsi_mgr_get_panel(msm_dsi);
+
+	if (!msm_dsi || !msm_dsi->host || !IS_BONDED_DSI() ||
+	    !IS_MASTER_DSI_LINK(msm_dsi->id))
+		return false;
+
+	other_dsi = dsi_mgr_get_other_dsi(msm_dsi->id);
+	if (!other_dsi || !other_dsi->host)
+		return false;
+
+	if (!panel || !panel->funcs->seamless_mode_valid)
+		return false;
+
+	if (!drm_mode_equal(old_mode, new_mode) &&
+	    (old_mode->hdisplay != new_mode->hdisplay ||
+	     old_mode->vdisplay != new_mode->vdisplay))
+		return false;
+
+	return panel->funcs->seamless_mode_valid(panel, old_mode, new_mode);
+}
+
+int msm_dsi_manager_seamless_mode_set(struct msm_dsi *msm_dsi,
+				      const struct drm_display_mode *old_mode,
+				      const struct drm_display_mode *new_mode)
+{
+	struct msm_dsi *other_dsi;
+	int ret;
+
+	if (!msm_dsi || !msm_dsi->host || !IS_BONDED_DSI() ||
+	    !IS_MASTER_DSI_LINK(msm_dsi->id))
+		return -EINVAL;
+
+	other_dsi = dsi_mgr_get_other_dsi(msm_dsi->id);
+	if (!other_dsi || !other_dsi->host)
+		return -EINVAL;
+
+	ret = msm_dsi_host_seamless_mode_set(msm_dsi->host, new_mode, true);
+	if (ret)
+		return ret;
+
+	ret = msm_dsi_host_seamless_mode_set(other_dsi->host, new_mode, true);
+	if (ret) {
+		msm_dsi_host_seamless_mode_set(msm_dsi->host, old_mode, true);
+		msm_dsi_host_seamless_mode_set(other_dsi->host, old_mode, true);
+		msm_dsi_host_timing_db_update(msm_dsi->host, false);
+		msm_dsi_host_timing_db_update(other_dsi->host, false);
+	}
+
+	return ret;
+}
+
+void msm_dsi_manager_seamless_begin(struct msm_dsi *msm_dsi)
+{
+	struct drm_panel *panel = dsi_mgr_get_panel(msm_dsi);
+
+	if (panel && panel->funcs->seamless_mode_begin)
+		panel->funcs->seamless_mode_begin(panel);
+}
+
+void msm_dsi_manager_seamless_pre_kickoff(struct msm_dsi *msm_dsi,
+					  const struct drm_display_mode *old_mode,
+					  const struct drm_display_mode *new_mode)
+{
+	struct drm_panel *panel = dsi_mgr_get_panel(msm_dsi);
+	int ret;
+
+	if (!panel || !panel->funcs->seamless_mode_pre_kickoff)
+		return;
+
+	ret = panel->funcs->seamless_mode_pre_kickoff(panel, old_mode, new_mode);
+	if (ret)
+		dev_err(panel->dev, "seamless pre-kickoff command failed: %d\n", ret);
+}
+
+void msm_dsi_manager_seamless_post_kickoff(struct msm_dsi *msm_dsi,
+					   const struct drm_display_mode *old_mode,
+					   const struct drm_display_mode *new_mode)
+{
+	struct drm_panel *panel = dsi_mgr_get_panel(msm_dsi);
+	int ret;
+
+	/* N81A requires B2/B3 after all physical encoders have kicked off. */
+	if (panel && panel->funcs->seamless_mode_post_kickoff) {
+		ret = panel->funcs->seamless_mode_post_kickoff(panel, old_mode,
+								new_mode);
+		if (ret)
+			dev_err(panel->dev,
+				"seamless post-kickoff command failed: %d\n", ret);
+	}
+}
+
+void msm_dsi_manager_seamless_complete(struct msm_dsi *msm_dsi)
+{
+	struct msm_dsi *other_dsi;
+	int ret;
+
+	if (!IS_BONDED_DSI() || !IS_MASTER_DSI_LINK(msm_dsi->id))
+		return;
+
+	other_dsi = dsi_mgr_get_other_dsi(msm_dsi->id);
+	ret = msm_dsi_host_timing_db_update(msm_dsi->host, false);
+	if (ret)
+		dev_err(&msm_dsi->pdev->dev, "failed to disable DSI timing DB: %d\n", ret);
+	if (other_dsi) {
+		ret = msm_dsi_host_timing_db_update(other_dsi->host, false);
+		if (ret)
+			dev_err(&other_dsi->pdev->dev,
+				"failed to disable DSI1 timing DB: %d\n", ret);
+	}
+}
 
 /* initialize bridge */
 int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
