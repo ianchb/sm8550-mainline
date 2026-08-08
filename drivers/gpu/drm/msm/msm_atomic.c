@@ -5,6 +5,8 @@
  */
 
 #include <drm/drm_atomic_uapi.h>
+#include <drm/drm_blend.h>
+#include <drm/drm_self_refresh_helper.h>
 #include <drm/drm_vblank.h>
 
 #include "msm_atomic_trace.h"
@@ -207,7 +209,32 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
 	if (ret)
 		return ret;
 
-	return drm_atomic_helper_check(dev, state);
+	ret = drm_atomic_helper_check_modeset(dev, state);
+	if (ret)
+		return ret;
+
+	if (kms && kms->funcs && kms->funcs->check_seamless_mode_changed) {
+		ret = kms->funcs->check_seamless_mode_changed(kms, state);
+		if (ret)
+			return ret;
+	}
+
+	if (dev->mode_config.normalize_zpos) {
+		ret = drm_atomic_normalize_zpos(dev, state);
+		if (ret)
+			return ret;
+	}
+
+	ret = drm_atomic_helper_check_planes(dev, state);
+	if (ret)
+		return ret;
+
+	if (state->legacy_cursor_update)
+		state->async_update = !drm_atomic_helper_async_check(dev, state);
+
+	drm_self_refresh_helper_alter_state(state);
+
+	return 0;
 }
 
 void msm_atomic_commit_tail(struct drm_atomic_commit *state)
