@@ -50,6 +50,20 @@ void dpu_encoder_trigger_kickoff_pending(struct drm_encoder *encoder);
 
 void dpu_encoder_kickoff(struct drm_encoder *encoder);
 
+bool dpu_encoder_seamless_mode_valid(struct drm_encoder *encoder,
+				     const struct drm_display_mode *old_mode,
+				     const struct drm_display_mode *new_mode);
+int dpu_encoder_prepare_seamless_mode(struct drm_encoder *encoder,
+				      struct drm_crtc_state *crtc_state,
+				      const struct drm_display_mode *old_mode);
+void dpu_encoder_seamless_pre_kickoff(struct drm_encoder *encoder,
+				      const struct drm_display_mode *old_mode,
+				      const struct drm_display_mode *new_mode);
+void dpu_encoder_seamless_post_kickoff(struct drm_encoder *encoder,
+				       const struct drm_display_mode *old_mode,
+				       const struct drm_display_mode *new_mode);
+void dpu_encoder_complete_seamless_mode(struct drm_encoder *encoder);
+
 int dpu_encoder_vsync_time(struct drm_encoder *drm_enc, ktime_t *wakeup_time);
 
 int dpu_encoder_wait_for_commit_done(struct drm_encoder *drm_encoder);
@@ -73,6 +87,8 @@ int dpu_encoder_get_vsync_count(struct drm_encoder *drm_enc);
 bool dpu_encoder_is_widebus_enabled(const struct drm_encoder *drm_enc);
 
 bool dpu_encoder_is_dsc_enabled(const struct drm_encoder *drm_enc);
+
+unsigned int dpu_encoder_get_max_vrefresh(const struct drm_encoder *drm_enc);
 
 int dpu_encoder_get_crc_values_cnt(const struct drm_encoder *drm_enc);
 

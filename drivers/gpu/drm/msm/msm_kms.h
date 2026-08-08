@@ -67,6 +67,9 @@ struct msm_kms_funcs {
 	 * Verify if the commit requires a full modeset on one of CRTCs.
 	 */
 	int (*check_mode_changed)(struct msm_kms *kms, struct drm_atomic_commit *state);
+	/* Convert explicitly supported active timing changes to seamless updates. */
+	int (*check_seamless_mode_changed)(struct msm_kms *kms,
+					   struct drm_atomic_commit *state);
 
 	/**
 	 * Prepare for atomic commit.  This is called after any previous

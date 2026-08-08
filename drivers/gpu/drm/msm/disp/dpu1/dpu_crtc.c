@@ -1169,6 +1169,8 @@ static struct drm_crtc_state *dpu_crtc_duplicate_state(struct drm_crtc *crtc)
 
 	/* duplicate base helper */
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &cstate->base);
+	cstate->seamless_mode_changed = false;
+	cstate->seamless_mode_prepared = false;
 
 	return &cstate->base;
 }
