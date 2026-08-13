@@ -8,12 +8,26 @@
 
 #include <drm/drm_modes.h>
 #include <drm/msm_drm.h>
+#include <drm/display/drm_dp.h>
+#include <drm/display/drm_dsc.h>
 
 #include "dp_aux.h"
 #include "dp_link.h"
 
 struct edid;
 struct drm_connector_state;
+
+struct msm_dp_dsc_config {
+	struct drm_dsc_config drm;
+	u32 extra_dto_cycles;
+	u32 extra_width;
+	u32 eol_byte_num;
+	u32 bytes_per_slice;
+	u32 be_in_lane;
+	u32 overhead_num;
+	u32 overhead_den;
+	bool enabled;
+};
 
 struct msm_dp_display_mode {
 	struct drm_display_mode drm_mode;
@@ -31,6 +45,7 @@ struct msm_dp_panel_psr {
 struct msm_dp_panel {
 	/* dpcd raw data */
 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+	u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE];
 	u8 downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
 
 	struct msm_dp_link_info link_info;
@@ -38,8 +53,10 @@ struct msm_dp_panel {
 	struct drm_connector *connector;
 	struct msm_dp_display_mode msm_dp_mode;
 	struct msm_dp_panel_psr psr_cap;
+	struct msm_dp_dsc_config dsc;
 	bool video_test;
 	bool vsc_sdp_supported;
+	bool fec_capable;
 	u32 hw_revision;
 
 	u32 max_bw_code;
@@ -60,6 +77,8 @@ void msm_dp_panel_handle_sink_request(struct msm_dp_panel *msm_dp_panel);
 void msm_dp_panel_tpg_config(struct msm_dp_panel *msm_dp_panel, bool enable);
 
 void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel);
+void msm_dp_panel_ack_dsc_dto(struct msm_dp_panel *msm_dp_panel);
+void msm_dp_panel_config_dsc(struct msm_dp_panel *msm_dp_panel, bool enable);
 
 void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel,
 				 const struct dp_sdp *vsc_sdp);

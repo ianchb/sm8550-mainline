@@ -102,6 +102,8 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
 				 struct msm_display_topology *topology,
 				 struct drm_atomic_commit *state,
 				 const struct drm_display_mode *adj_mode);
+int dpu_encoder_try_disable_dsc(struct drm_encoder *drm_enc,
+				struct drm_atomic_commit *state);
 
 bool dpu_encoder_needs_modeset(struct drm_encoder *drm_enc, struct drm_atomic_commit *state);
 

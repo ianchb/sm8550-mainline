@@ -4,6 +4,9 @@
  */
 
 #include <linux/string_choices.h>
+#include <linux/math64.h>
+#include <drm/display/drm_dp_helper.h>
+#include <drm/display/drm_dsc_helper.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_bridge.h>
@@ -15,12 +18,342 @@
 #include "dp_audio.h"
 #include "dp_drm.h"
 
+static const struct drm_bridge_funcs msm_dp_bridge_ops;
+
+static struct drm_bridge_state *
+msm_dp_bridge_atomic_duplicate_state(struct drm_bridge *bridge)
+{
+	struct msm_dp_bridge_state *state;
+
+	state = kmemdup(bridge->base.state, sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return NULL;
+
+	__drm_atomic_helper_bridge_duplicate_state(bridge, &state->base);
+
+	return &state->base;
+}
+
+static void msm_dp_bridge_atomic_destroy_state(struct drm_bridge *bridge,
+					       struct drm_bridge_state *state)
+{
+	kfree(to_msm_dp_bridge_state(state));
+}
+
+static struct drm_bridge_state *
+msm_dp_bridge_atomic_reset(struct drm_bridge *bridge)
+{
+	struct msm_dp_bridge_state *state;
+
+	state = kzalloc_obj(*state);
+	if (!state)
+		return NULL;
+
+	__drm_atomic_helper_bridge_reset(bridge, &state->base);
+
+	return &state->base;
+}
+
+static bool msm_dp_dsc_bpc_supported(const u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE],
+				     u8 bpc)
+{
+	u8 supported_bpc[3];
+	int count, i;
+
+	count = drm_dp_dsc_sink_supported_input_bpcs(dsc_dpcd, supported_bpc);
+	for (i = 0; i < count; i++)
+		if (supported_bpc[i] == bpc)
+			return true;
+
+	return false;
+}
+
+static int msm_dp_dsc_slice_count(const u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE],
+				  const struct drm_display_mode *mode)
+{
+	static const u8 slice_counts[] = { 1, 2, 4, 8, 12, 16, 20, 24 };
+	u32 supported = drm_dp_dsc_sink_slice_count_mask(dsc_dpcd, false);
+	u8 throughput;
+	int max_slice_width = drm_dp_dsc_sink_max_slice_width(dsc_dpcd);
+	int max_throughput;
+	int min_slices;
+	int i;
+
+	if (mode->clock <= 340000)
+		min_slices = 1;
+	else if (mode->clock <= 680000)
+		min_slices = 2;
+	else if (mode->clock <= 1360000)
+		min_slices = 4;
+	else if (mode->clock <= 3200000)
+		min_slices = 8;
+	else if (mode->clock <= 4800000)
+		min_slices = 12;
+	else if (mode->clock <= 6400000)
+		min_slices = 16;
+	else if (mode->clock <= 8000000)
+		min_slices = 20;
+	else if (mode->clock <= 9600000)
+		min_slices = 24;
+	else
+		return -EINVAL;
+
+	throughput = dsc_dpcd[DP_DSC_PEAK_THROUGHPUT - DP_DSC_SUPPORT] &
+		     DP_DSC_THROUGHPUT_MODE_0_MASK;
+	if (!throughput || throughput == DP_DSC_THROUGHPUT_MODE_0_MASK)
+		return -EINVAL;
+
+	max_throughput = drm_dp_dsc_sink_max_slice_throughput(dsc_dpcd,
+							      mode->clock, true);
+	if (!max_slice_width || !max_throughput)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(slice_counts); i++) {
+		int count = slice_counts[i];
+		int slice_width;
+
+		if (count < min_slices || !(supported & BIT(count - 1)))
+			continue;
+		if (mode->hdisplay % count)
+			continue;
+
+		slice_width = mode->hdisplay / count;
+		if (slice_width >= max_slice_width)
+			continue;
+		if (DIV_ROUND_UP(mode->clock, count) > max_throughput)
+			continue;
+
+		return count;
+	}
+
+	return -EINVAL;
+}
+
+static u16 msm_dp_dsc_slice_height(u16 pic_height)
+{
+	if (!(pic_height % 108))
+		return 108;
+	if (!(pic_height % 16))
+		return 16;
+	if (!(pic_height % 12))
+		return 12;
+
+	return 15;
+}
+
+static void msm_dp_dsc_calc_dp_params(struct msm_dp_dsc_config *dsc,
+				      u8 lane_count)
+{
+	const struct drm_dsc_config *cfg = &dsc->drm;
+	u32 total_bytes = cfg->slice_chunk_size * cfg->slice_count;
+	u32 eoc_bytes = cfg->slice_chunk_size % lane_count;
+	u32 dummy_bytes = eoc_bytes ?
+		(lane_count - eoc_bytes) * cfg->slice_count : 0;
+	u32 pclk_per_line = DIV_ROUND_UP(total_bytes, 6);
+	u32 last_pclk = (cfg->pic_width / 2) % 3;
+	u32 last_ack = pclk_per_line - cfg->pic_width / 6;
+	u32 required_pclk = 0;
+	u32 remainder = 1;
+	u32 accumulated = 0;
+
+	while (accumulated < last_ack) {
+		u32 start;
+
+		required_pclk++;
+		start = remainder >= 1 ? remainder : remainder + 3;
+		remainder = start - 1;
+		if (remainder < 1)
+			accumulated++;
+	}
+
+	dsc->extra_width = required_pclk > last_pclk ?
+			   required_pclk - last_pclk : 0;
+	dsc->extra_dto_cycles = pclk_per_line - 1;
+	dsc->bytes_per_slice = cfg->slice_chunk_size;
+	dsc->eol_byte_num = ALIGN(total_bytes, 3) - total_bytes;
+	dsc->overhead_num = total_bytes + lane_count * cfg->slice_count +
+			    dummy_bytes;
+	dsc->overhead_den = total_bytes;
+	dsc->be_in_lane = 10;
+}
+
+int msm_dp_dsc_compute_config(struct msm_dp_dsc_config *dsc,
+			      const u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE],
+			      const struct drm_display_mode *mode,
+			      u8 max_bpc, u8 lane_count)
+{
+	struct drm_dsc_config *cfg = &dsc->drm;
+	u8 bpc;
+	u8 line_buf_depth;
+	u8 revision;
+	int slice_count;
+	int ret;
+
+	memset(dsc, 0, sizeof(*dsc));
+
+	if (!mode || !lane_count || !drm_dp_sink_supports_dsc(dsc_dpcd) ||
+	    !drm_dp_dsc_sink_supports_format(dsc_dpcd, DP_DSC_RGB))
+		return -EOPNOTSUPP;
+
+	if (max_bpc >= 10 && msm_dp_dsc_bpc_supported(dsc_dpcd, 10))
+		bpc = 10;
+	else if (max_bpc >= 8 && msm_dp_dsc_bpc_supported(dsc_dpcd, 8))
+		bpc = 8;
+	else
+		return -EOPNOTSUPP;
+
+	revision = dsc_dpcd[DP_DSC_REV - DP_DSC_SUPPORT];
+	cfg->dsc_version_major = (revision & DP_DSC_MAJOR_MASK) >>
+				 DP_DSC_MAJOR_SHIFT;
+	cfg->dsc_version_minor = (revision & DP_DSC_MINOR_MASK) >>
+				 DP_DSC_MINOR_SHIFT;
+	if (cfg->dsc_version_major != 1 ||
+	    (cfg->dsc_version_minor != 1 && cfg->dsc_version_minor != 2)) {
+		cfg->dsc_version_major = 1;
+		cfg->dsc_version_minor = 1;
+	}
+
+	slice_count = msm_dp_dsc_slice_count(dsc_dpcd, mode);
+	if (slice_count < 0)
+		return slice_count;
+
+	cfg->pic_width = mode->hdisplay;
+	cfg->pic_height = mode->vdisplay;
+	cfg->slice_count = slice_count;
+	cfg->slice_width = mode->hdisplay / slice_count;
+	cfg->slice_height = msm_dp_dsc_slice_height(mode->vdisplay);
+	cfg->bits_per_component = bpc;
+	cfg->bits_per_pixel = 8 << 4;
+	cfg->block_pred_enable =
+		dsc_dpcd[DP_DSC_BLK_PREDICTION_SUPPORT - DP_DSC_SUPPORT] &
+		DP_DSC_BLK_PREDICTION_IS_SUPPORTED;
+	line_buf_depth = drm_dp_dsc_sink_line_buf_depth(dsc_dpcd);
+	if (!line_buf_depth)
+		return -EINVAL;
+	cfg->line_buf_depth = line_buf_depth;
+
+	cfg->simple_422 = false;
+	cfg->convert_rgb = true;
+	cfg->vbr_enable = false;
+	drm_dsc_set_const_params(cfg);
+	drm_dsc_set_rc_buf_thresh(cfg);
+	ret = drm_dsc_setup_rc_params(cfg, DRM_DSC_1_1_PRE_SCR);
+	if (ret)
+		return ret;
+
+	cfg->initial_scale_value = drm_dsc_initial_scale_value(cfg);
+	ret = drm_dsc_compute_rc_parameters(cfg);
+	if (ret)
+		return ret;
+
+	dsc->enabled = true;
+	msm_dp_dsc_calc_dp_params(dsc, lane_count);
+
+	return 0;
+}
+
+static u64 msm_dp_dsc_mode_rate(const struct msm_dp_dsc_config *dsc, int clock)
+{
+	u64 rate = (u64)clock * drm_dsc_get_bpp_int(&dsc->drm);
+
+	rate = DIV_ROUND_UP_ULL(rate * dsc->overhead_num, dsc->overhead_den);
+
+	return DIV_ROUND_UP_ULL(rate * 100000, 97582);
+}
+
+struct drm_dsc_config *msm_dp_bridge_get_dsc_config(struct drm_encoder *encoder,
+						    struct drm_atomic_commit *state)
+{
+	struct drm_bridge *bridge __free(drm_bridge_put) =
+		drm_bridge_chain_get_first_bridge(encoder);
+	struct drm_bridge_state *bridge_state;
+	struct msm_dp_bridge_state *msm_state;
+
+	if (!bridge)
+		return NULL;
+
+	bridge_state = state ? drm_atomic_get_new_bridge_state(state, bridge) :
+			       drm_priv_to_bridge_state(bridge->base.state);
+	if (!bridge_state)
+		return NULL;
+
+	msm_state = to_msm_dp_bridge_state(bridge_state);
+
+	return msm_state->dsc.enabled ? &msm_state->dsc.drm : NULL;
+}
+
+int msm_dp_bridge_disable_dsc(struct drm_encoder *encoder,
+			      struct drm_atomic_commit *state)
+{
+	struct drm_bridge *bridge __free(drm_bridge_put) =
+		drm_bridge_chain_get_first_bridge(encoder);
+	struct drm_bridge_state *bridge_state;
+	struct msm_dp_bridge_state *msm_state;
+	struct msm_dp *dp;
+	struct drm_connector *connector;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	u64 mode_rate, link_rate;
+	u32 max_bpp;
+	u32 mode_clock;
+
+	if (!bridge || bridge->funcs != &msm_dp_bridge_ops)
+		return -EOPNOTSUPP;
+
+	bridge_state = drm_atomic_get_new_bridge_state(state, bridge);
+	if (!bridge_state)
+		return -EINVAL;
+	msm_state = to_msm_dp_bridge_state(bridge_state);
+	if (!msm_state->dsc.enabled)
+		return -EOPNOTSUPP;
+
+	crtc = drm_atomic_get_new_crtc_for_encoder(state, encoder);
+	if (!crtc)
+		return -EINVAL;
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	if (!crtc_state)
+		return -EINVAL;
+	connector = drm_atomic_get_new_connector_for_encoder(state, encoder);
+	if (!connector)
+		return -EINVAL;
+
+	dp = to_dp_bridge(bridge)->msm_dp_display;
+	max_bpp = connector->display_info.bpc * 3;
+	if (!max_bpp)
+		max_bpp = 24;
+	mode_clock = crtc_state->adjusted_mode.clock;
+	msm_state->bpp = msm_dp_display_get_mode_bpp(dp, max_bpp, mode_clock);
+	if (!msm_state->bpp)
+		return -ENOSPC;
+
+	mode_rate = (u64)mode_clock * msm_state->bpp;
+	link_rate = (u64)msm_dp_display_get_link_rate(dp) *
+		msm_dp_display_get_lane_count(dp) * 8;
+	if (msm_dp_display_fec_capable(dp))
+		link_rate = div64_u64(link_rate * 97582, 100000);
+	if (mode_rate > link_rate)
+		return -ENOSPC;
+
+	memset(&msm_state->dsc, 0, sizeof(msm_state->dsc));
+
+	return 0;
+}
+
 static int msm_dp_bridge_atomic_check(struct drm_bridge *bridge,
 				      struct drm_bridge_state *bridge_state,
 				      struct drm_crtc_state *crtc_state,
 				      struct drm_connector_state *conn_state)
 {
 	struct drm_connector_state *old_conn_state;
+	struct msm_dp_bridge_state *msm_state =
+		to_msm_dp_bridge_state(bridge_state);
+	struct msm_dp *dp = to_dp_bridge(bridge)->msm_dp_display;
+	u64 link_rate;
+	u32 max_bpp;
+	u32 mode_clock;
+
+	memset(&msm_state->dsc, 0, sizeof(msm_state->dsc));
+	msm_state->bpp = 0;
 
 	old_conn_state =
 		drm_atomic_get_old_connector_state(conn_state->state,
@@ -35,6 +368,34 @@ static int msm_dp_bridge_atomic_check(struct drm_bridge *bridge,
 	    (!drm_connector_atomic_hdr_metadata_equal(old_conn_state, conn_state) ||
 	     old_conn_state->colorspace != conn_state->colorspace))
 		crtc_state->mode_changed = true;
+
+	if (conn_state->crtc && crtc_state && crtc_state->active) {
+		max_bpp = conn_state->connector->display_info.bpc * 3;
+		if (!max_bpp)
+			max_bpp = 24;
+		if (msm_dp_display_check_video_test(dp))
+			max_bpp = msm_dp_display_get_test_bpp(dp);
+
+		mode_clock = crtc_state->adjusted_mode.clock;
+		msm_state->bpp = msm_dp_display_get_mode_bpp(dp, max_bpp, mode_clock);
+		link_rate = (u64)msm_dp_display_get_link_rate(dp) *
+			msm_dp_display_get_lane_count(dp) * 8;
+		if (!dp->is_edp && msm_dp_display_fec_capable(dp) &&
+		    !msm_dp_display_check_video_test(dp) &&
+		    !drm_mode_is_420_only(&conn_state->connector->display_info,
+					  &crtc_state->adjusted_mode) &&
+		    !msm_dp_dsc_compute_config(&msm_state->dsc,
+					       msm_dp_display_get_dsc_dpcd(dp),
+					       &crtc_state->adjusted_mode,
+					       min_t(u32, max_bpp / 3, 10),
+					       msm_dp_display_get_lane_count(dp)) &&
+		    msm_dp_dsc_mode_rate(&msm_state->dsc,
+					 crtc_state->adjusted_mode.clock) <= link_rate)
+			msm_state->bpp =
+				msm_state->dsc.drm.bits_per_component * 3;
+		else
+			memset(&msm_state->dsc, 0, sizeof(msm_state->dsc));
+	}
 
 	return 0;
 }
@@ -86,9 +447,9 @@ static void msm_dp_bridge_debugfs_init(struct drm_bridge *bridge, struct dentry 
 }
 
 static const struct drm_bridge_funcs msm_dp_bridge_ops = {
-	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
-	.atomic_destroy_state   = drm_atomic_helper_bridge_destroy_state,
-	.atomic_reset           = drm_atomic_helper_bridge_reset,
+	.atomic_duplicate_state = msm_dp_bridge_atomic_duplicate_state,
+	.atomic_destroy_state   = msm_dp_bridge_atomic_destroy_state,
+	.atomic_reset           = msm_dp_bridge_atomic_reset,
 	.atomic_enable          = msm_dp_bridge_atomic_enable,
 	.atomic_disable         = msm_dp_bridge_atomic_disable,
 	.atomic_post_disable    = msm_dp_bridge_atomic_post_disable,
@@ -272,9 +633,9 @@ static const struct drm_bridge_funcs msm_edp_bridge_ops = {
 	.atomic_post_disable = msm_edp_bridge_atomic_post_disable,
 	.mode_set = msm_dp_bridge_mode_set,
 	.mode_valid = msm_edp_bridge_mode_valid,
-	.atomic_reset = drm_atomic_helper_bridge_reset,
-	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
-	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
+	.atomic_reset = msm_dp_bridge_atomic_reset,
+	.atomic_duplicate_state = msm_dp_bridge_atomic_duplicate_state,
+	.atomic_destroy_state = msm_dp_bridge_atomic_destroy_state,
 	.atomic_check = msm_edp_bridge_atomic_check,
 	.debugfs_init = msm_edp_bridge_debugfs_init,
 };

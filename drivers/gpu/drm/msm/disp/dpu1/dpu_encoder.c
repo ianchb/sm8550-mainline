@@ -35,6 +35,7 @@
 #include "dpu_crtc.h"
 #include "dpu_trace.h"
 #include "dpu_core_irq.h"
+#include "dp/dp_drm.h"
 #include "dsi/dsi.h"
 #include "disp/msm_disp_snapshot.h"
 
@@ -656,8 +657,21 @@ struct drm_dsc_config *dpu_encoder_get_dsc_config(struct drm_encoder *drm_enc)
 
 	if (dpu_enc->disp_info.intf_type == INTF_DSI)
 		return msm_dsi_get_dsc_config(priv->kms->dsi[index]);
+	if (dpu_enc->disp_info.intf_type == INTF_DP)
+		return msm_dp_bridge_get_dsc_config(drm_enc, NULL);
 
 	return NULL;
+}
+
+int dpu_encoder_try_disable_dsc(struct drm_encoder *drm_enc,
+				struct drm_atomic_commit *state)
+{
+	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+
+	if (dpu_enc->disp_info.intf_type != INTF_DP)
+		return -EOPNOTSUPP;
+
+	return msm_dp_bridge_disable_dsc(drm_enc, state);
 }
 
 void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
@@ -680,7 +694,9 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
 		if (dpu_enc->phys_encs[i])
 			topology->num_intf++;
 
-	dsc = dpu_encoder_get_dsc_config(drm_enc);
+	dsc = disp_info->intf_type == INTF_DP ?
+		msm_dp_bridge_get_dsc_config(drm_enc, state) :
+		dpu_encoder_get_dsc_config(drm_enc);
 
 	/* We only support 2 DSC mode (with 2 LM and 1 INTF) */
 	if (dsc) {
@@ -693,7 +709,10 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
 		 */
 		WARN(topology->num_intf > 2,
 		     "DSC topology cannot support more than 2 interfaces\n");
-		if (topology->num_intf >= 2 || dpu_kms->catalog->dsc_count >= 2)
+		if (disp_info->intf_type == INTF_DP)
+			topology->num_dsc = adj_mode->hdisplay >
+				dpu_kms->catalog->caps->max_mixer_width ? 2 : 1;
+		else if (topology->num_intf >= 2 || dpu_kms->catalog->dsc_count >= 2)
 			topology->num_dsc = 2;
 		else
 			topology->num_dsc = 1;
@@ -1230,9 +1249,10 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
 	num_dsc = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
 						drm_enc->crtc, DPU_HW_BLK_DSC,
 						hw_dsc, ARRAY_SIZE(hw_dsc));
-	for (i = 0; i < num_dsc; i++) {
-		dpu_enc->hw_dsc[i] = to_dpu_hw_dsc(hw_dsc[i]);
-		dsc_mask |= BIT(dpu_enc->hw_dsc[i]->idx - DSC_0);
+	for (i = 0; i < MAX_CHANNELS_PER_ENC; i++) {
+		dpu_enc->hw_dsc[i] = i < num_dsc ? to_dpu_hw_dsc(hw_dsc[i]) : NULL;
+		if (dpu_enc->hw_dsc[i])
+			dsc_mask |= BIT(dpu_enc->hw_dsc[i]->idx - DSC_0);
 	}
 
 	dpu_enc->dsc_mask = dsc_mask;
@@ -2045,6 +2065,8 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 
 		num_dsc++;
 	}
+	if (WARN_ON(!num_dsc))
+		return;
 
 	pic_width = dsc->pic_width;
 

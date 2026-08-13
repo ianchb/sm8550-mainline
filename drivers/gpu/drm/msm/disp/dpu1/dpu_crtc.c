@@ -1441,7 +1441,9 @@ static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
 	struct dpu_kms *dpu_kms = _dpu_crtc_get_kms(crtc);
 	struct dpu_global_state *global_state;
 	struct dpu_crtc_state *cstate;
+	struct drm_encoder *encoder;
 	struct msm_display_topology topology;
+	bool dsc_disabled = false;
 	int ret;
 
 	/*
@@ -1459,6 +1461,28 @@ static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
 	topology = dpu_crtc_get_topology(crtc, dpu_kms, crtc_state);
 	ret = dpu_rm_reserve(&dpu_kms->rm, global_state,
 			     crtc_state->crtc, &topology);
+	if (ret == -ENAVAIL && topology.num_dsc) {
+		struct drm_atomic_commit *state = crtc_state->state;
+
+		drm_for_each_encoder_mask(encoder, crtc->dev,
+					  crtc_state->encoder_mask) {
+			int fallback_ret;
+
+			fallback_ret = dpu_encoder_try_disable_dsc(encoder, state);
+			if (!fallback_ret)
+				dsc_disabled = true;
+			else if (fallback_ret != -EOPNOTSUPP)
+				return fallback_ret;
+		}
+
+		if (dsc_disabled) {
+			dpu_rm_release(global_state, crtc);
+			topology = dpu_crtc_get_topology(crtc, dpu_kms,
+							 crtc_state);
+			ret = dpu_rm_reserve(&dpu_kms->rm, global_state,
+					     crtc_state->crtc, &topology);
+		}
+	}
 	if (ret)
 		return ret;
 

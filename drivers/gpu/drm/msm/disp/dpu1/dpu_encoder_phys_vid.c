@@ -9,6 +9,7 @@
 #include "dpu_core_irq.h"
 #include "dpu_formats.h"
 #include "dpu_trace.h"
+#include "dp/dp_drm.h"
 #include "disp/msm_disp_snapshot.h"
 #include "msm_dsc_helper.h"
 
@@ -114,15 +115,33 @@ static void drm_mode_to_intf_timing_params(
 	}
 
 	/*
-	 * for DP, divide the horizonal parameters by 2 when
-	 * widebus is enabled
+	 * for DP, divide the horizontal parameters by 2 when
+	 * widebus or compression is enabled
 	 */
-	if (phys_enc->hw_intf->cap->type == INTF_DP && timing->wide_bus_en) {
+	if (phys_enc->hw_intf->cap->type == INTF_DP &&
+	    (timing->wide_bus_en || timing->compression_en)) {
 		timing->width = timing->width >> 1;
 		timing->xres = timing->xres >> 1;
 		timing->h_back_porch = timing->h_back_porch >> 1;
 		timing->h_front_porch = timing->h_front_porch >> 1;
 		timing->hsync_pulse_width = timing->hsync_pulse_width >> 1;
+
+		if (timing->compression_en) {
+			struct drm_dsc_config *dsc =
+				dpu_encoder_get_dsc_config(phys_enc->parent);
+			struct msm_dp_dsc_config *dp_dsc;
+
+			if (WARN_ON(!dsc))
+				return;
+
+			dp_dsc = container_of(dsc, struct msm_dp_dsc_config, drm);
+			if (dpu_encoder_use_dsc_merge(phys_enc->parent)) {
+				timing->width += dp_dsc->extra_width;
+				timing->h_back_porch += dp_dsc->extra_width;
+				timing->extra_dto_cycles = dp_dsc->extra_dto_cycles;
+			}
+			timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
+		}
 	}
 
 	/*

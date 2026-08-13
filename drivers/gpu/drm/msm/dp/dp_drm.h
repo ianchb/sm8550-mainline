@@ -7,6 +7,7 @@
 #define _DP_DRM_H_
 
 #include <linux/types.h>
+#include <drm/display/drm_dsc.h>
 #include <drm/drm_bridge.h>
 
 #include "msm_drv.h"
@@ -19,11 +20,28 @@ struct msm_dp_bridge {
 
 #define to_dp_bridge(x)     container_of((x), struct msm_dp_bridge, bridge)
 
+struct msm_dp_bridge_state {
+	struct drm_bridge_state base;
+	struct msm_dp_dsc_config dsc;
+	u32 bpp;
+};
+
+#define to_msm_dp_bridge_state(x) \
+	container_of(x, struct msm_dp_bridge_state, base)
+
 struct drm_connector *msm_dp_drm_connector_init(struct msm_dp *msm_dp_display,
 					    struct drm_encoder *encoder);
 int msm_dp_bridge_init(struct msm_dp *msm_dp_display, struct drm_device *dev,
 		   struct drm_encoder *encoder,
 		   bool yuv_supported);
+struct drm_dsc_config *msm_dp_bridge_get_dsc_config(struct drm_encoder *encoder,
+						    struct drm_atomic_commit *state);
+int msm_dp_bridge_disable_dsc(struct drm_encoder *encoder,
+			      struct drm_atomic_commit *state);
+int msm_dp_dsc_compute_config(struct msm_dp_dsc_config *dsc,
+			      const u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE],
+			      const struct drm_display_mode *mode,
+			      u8 max_bpc, u8 lane_count);
 
 enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
 					       struct drm_connector *connector);

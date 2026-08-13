@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/string_choices.h>
 #include <drm/display/drm_dp_aux_bus.h>
+#include <drm/display/drm_dsc_helper.h>
 #include <drm/display/drm_hdmi_audio_helper.h>
 #include <drm/drm_edid.h>
 
@@ -695,7 +696,9 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	const u32 num_components = 3, default_bpp = 24;
 	struct msm_dp_display_private *msm_dp_display;
 	struct msm_dp_link_info *link_info;
-	u32 mode_rate_khz = 0, supported_rate_khz = 0, mode_bpp = 0;
+	u32 mode_rate_khz = 0, supported_rate_khz = 0;
+	u32 uncompressed_rate_khz, mode_bpp = 0;
+	struct msm_dp_dsc_config dsc;
 	struct msm_dp *dp;
 	int mode_pclk_khz = mode->clock;
 
@@ -726,9 +729,30 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
 
 	mode_rate_khz = mode_pclk_khz * mode_bpp;
 	supported_rate_khz = link_info->num_lanes * link_info->rate * 8;
+	uncompressed_rate_khz = supported_rate_khz;
+	if (msm_dp_display->panel->fec_capable)
+		uncompressed_rate_khz = mult_frac(uncompressed_rate_khz,
+						  97582, 100000);
 
-	if (mode_rate_khz > supported_rate_khz)
-		return MODE_BAD;
+	if (mode_rate_khz > uncompressed_rate_khz) {
+		u8 max_bpc = clamp_t(u8, dp->connector->display_info.bpc, 8, 10);
+		u64 dsc_rate;
+
+		if (!msm_dp_display->panel->fec_capable ||
+		    drm_mode_is_420_only(&dp->connector->display_info, mode) ||
+		    msm_dp_dsc_compute_config(&dsc,
+					      msm_dp_display->panel->dsc_dpcd,
+					      mode, max_bpc,
+					      link_info->num_lanes))
+			return MODE_BAD;
+
+		dsc_rate = (u64)mode->clock * drm_dsc_get_bpp_int(&dsc.drm);
+		dsc_rate = DIV_ROUND_UP_ULL(dsc_rate * dsc.overhead_num,
+					    dsc.overhead_den);
+		dsc_rate = DIV_ROUND_UP_ULL(dsc_rate * 100000, 97582);
+		if (dsc_rate > supported_rate_khz)
+			return MODE_BAD;
+	}
 
 	return MODE_OK;
 }
@@ -1307,6 +1331,52 @@ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
 	return dp->wide_bus_supported;
 }
 
+const u8 *msm_dp_display_get_dsc_dpcd(struct msm_dp *msm_dp_display)
+{
+	struct msm_dp_display_private *dp = container_of(msm_dp_display,
+						struct msm_dp_display_private,
+						msm_dp_display);
+
+	return dp->panel->dsc_dpcd;
+}
+
+bool msm_dp_display_fec_capable(struct msm_dp *msm_dp_display)
+{
+	struct msm_dp_display_private *dp = container_of(msm_dp_display,
+						struct msm_dp_display_private,
+						msm_dp_display);
+
+	return dp->panel->fec_capable;
+}
+
+u32 msm_dp_display_get_link_rate(struct msm_dp *msm_dp_display)
+{
+	struct msm_dp_display_private *dp = container_of(msm_dp_display,
+						struct msm_dp_display_private,
+						msm_dp_display);
+
+	return dp->link->link_params.rate;
+}
+
+u32 msm_dp_display_get_lane_count(struct msm_dp *msm_dp_display)
+{
+	struct msm_dp_display_private *dp = container_of(msm_dp_display,
+						struct msm_dp_display_private,
+						msm_dp_display);
+
+	return dp->link->link_params.num_lanes;
+}
+
+u32 msm_dp_display_get_mode_bpp(struct msm_dp *msm_dp_display, u32 max_bpp,
+				u32 mode_clock)
+{
+	struct msm_dp_display_private *dp = container_of(msm_dp_display,
+						struct msm_dp_display_private,
+						msm_dp_display);
+
+	return msm_dp_panel_get_mode_bpp(dp->panel, max_bpp, mode_clock);
+}
+
 void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *root, bool is_edp)
 {
 	struct msm_dp_display_private *dp;
@@ -1356,6 +1426,8 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 				 struct drm_atomic_commit *state)
 {
 	struct msm_dp_bridge *msm_dp_bridge = to_dp_bridge(drm_bridge);
+	struct drm_bridge_state *drm_bridge_state;
+	struct msm_dp_bridge_state *bridge_state;
 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
 	int rc = 0;
 	struct msm_dp_display_private *msm_dp_display;
@@ -1367,6 +1439,13 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 	int colorspace_rc;
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+	drm_bridge_state = drm_atomic_get_new_bridge_state(state, drm_bridge);
+	if (WARN_ON(!drm_bridge_state))
+		return;
+	bridge_state = to_msm_dp_bridge_state(drm_bridge_state);
+	msm_dp_display->panel->dsc = bridge_state->dsc;
+	if (bridge_state->bpp)
+		msm_dp_display->msm_dp_mode.bpp = bridge_state->bpp;
 	conn_state = drm_atomic_get_new_connector_state(state, dp->connector);
 	old_conn_state = drm_atomic_get_old_connector_state(state, dp->connector);
 	if (old_conn_state && conn_state)

@@ -33,5 +33,11 @@ void msm_dp_display_signal_audio_start(struct msm_dp *msm_dp_display);
 void msm_dp_display_signal_audio_complete(struct msm_dp *msm_dp_display);
 void msm_dp_display_set_psr(struct msm_dp *dp, bool enter);
 void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *dentry, bool is_edp);
+const u8 *msm_dp_display_get_dsc_dpcd(struct msm_dp *msm_dp_display);
+bool msm_dp_display_fec_capable(struct msm_dp *msm_dp_display);
+u32 msm_dp_display_get_link_rate(struct msm_dp *msm_dp_display);
+u32 msm_dp_display_get_lane_count(struct msm_dp *msm_dp_display);
+u32 msm_dp_display_get_mode_bpp(struct msm_dp *msm_dp_display, u32 max_bpp,
+				u32 mode_clock);
 
 #endif /* _DP_DISPLAY_H_ */

@@ -10,6 +10,7 @@
 #include <drm/drm_connector.h>
 #include <drm/display/drm_dp_mst_helper.h>
 #include <drm/display/drm_hdmi_helper.h>
+#include <drm/display/drm_dsc_helper.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_of.h>
 #include <drm/drm_print.h>
@@ -225,6 +226,8 @@ static u32 msm_dp_panel_get_supported_bpp(struct msm_dp_panel *msm_dp_panel,
 
 	link_info = &msm_dp_panel->link_info;
 	data_rate_khz = link_info->num_lanes * link_info->rate * 8;
+	if (msm_dp_panel->fec_capable)
+		data_rate_khz = mult_frac(data_rate_khz, 97582, 100000);
 
 	do {
 		if (mode_pclk_khz * bpp <= data_rate_khz)
@@ -238,9 +241,10 @@ static u32 msm_dp_panel_get_supported_bpp(struct msm_dp_panel *msm_dp_panel,
 int msm_dp_panel_read_sink_caps(struct msm_dp_panel *msm_dp_panel,
 	struct drm_connector *connector)
 {
-	int rc, bw_code;
+	int rc, bw_code, rlen;
 	int count;
 	struct msm_dp_panel_private *panel;
+	u8 fec_cap = 0;
 
 	if (!msm_dp_panel || !connector) {
 		DRM_ERROR("invalid input\n");
@@ -276,6 +280,23 @@ int msm_dp_panel_read_sink_caps(struct msm_dp_panel *msm_dp_panel,
 					 msm_dp_panel->downstream_ports);
 	if (rc)
 		return rc;
+
+	msm_dp_panel->fec_capable = false;
+	memset(msm_dp_panel->dsc_dpcd, 0, sizeof(msm_dp_panel->dsc_dpcd));
+	if (msm_dp_panel->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_14) {
+		rlen = drm_dp_dpcd_readb(panel->aux, DP_FEC_CAPABILITY,
+					 &fec_cap);
+		if (rlen == 1 && (fec_cap & DP_FEC_CAPABLE)) {
+			msm_dp_panel->fec_capable = true;
+			rlen = drm_dp_dpcd_read(panel->aux, DP_DSC_SUPPORT,
+						msm_dp_panel->dsc_dpcd,
+						sizeof(msm_dp_panel->dsc_dpcd));
+			if (rlen != sizeof(msm_dp_panel->dsc_dpcd) ||
+			    !drm_dp_sink_supports_dsc(msm_dp_panel->dsc_dpcd))
+				memset(msm_dp_panel->dsc_dpcd, 0,
+				       sizeof(msm_dp_panel->dsc_dpcd));
+		}
+	}
 
 	drm_edid_free(msm_dp_panel->drm_edid);
 
@@ -483,6 +504,62 @@ void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel)
 		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
 
 	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, 0x0);
+}
+
+void msm_dp_panel_ack_dsc_dto(struct msm_dp_panel *msm_dp_panel)
+{
+	struct msm_dp_panel_private *panel =
+		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
+
+	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, BIT(1));
+}
+
+void msm_dp_panel_config_dsc(struct msm_dp_panel *msm_dp_panel, bool enable)
+{
+	struct msm_dp_panel_private *panel =
+		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
+	struct drm_dsc_picture_parameter_set pps = {};
+	const struct msm_dp_dsc_config *dsc = &msm_dp_panel->dsc;
+	u8 parity[24] = {};
+	u32 value;
+	int i;
+
+	if (!enable || !dsc->enabled) {
+		msm_dp_write_link(panel, REG_DP_COMPRESSION_MODE_CTRL, 0);
+		return;
+	}
+
+	drm_dsc_pps_payload_pack(&pps, &dsc->drm);
+	msm_dp_write_link(panel, REG_DP_PPS_HB_0_3, 0x007f1000);
+	msm_dp_write_link(panel, REG_DP_PPS_PB_0_3, 0x00a22300);
+	for (i = 0; i < 22; i++) {
+		const u8 *bytes = (const u8 *)&pps + i * 4;
+
+		value = (u32)bytes[0] | (u32)bytes[1] << 8 |
+			(u32)bytes[2] << 16 | (u32)bytes[3] << 24;
+		parity[i] = msm_dp_utils_calculate_parity(value);
+		msm_dp_write_link(panel, REG_DP_PPS_PPS_0_3 + i * 4, value);
+	}
+	for (i = 0; i < ARRAY_SIZE(parity) / 4; i++) {
+		value = (u32)parity[i * 4] |
+			(u32)parity[i * 4 + 1] << 8 |
+			(u32)parity[i * 4 + 2] << 16 |
+			(u32)parity[i * 4 + 3] << 24;
+		msm_dp_write_link(panel, REG_DP_PPS_PB_4_7 + i * 4, value);
+	}
+
+	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO_COUNT, dsc->extra_dto_cycles);
+	value = msm_dp_read_p0(panel, MMSS_DP_DSC_DTO);
+	value |= BIT(0) | BIT(3) | 1 << 8 | 3 << 16;
+	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, value);
+
+	value = BIT(0) | dsc->eol_byte_num << 3 |
+		(dsc->drm.slice_count - 1) << 5 |
+		dsc->be_in_lane << 10 | dsc->bytes_per_slice << 16;
+	msm_dp_write_link(panel, REG_DP_COMPRESSION_MODE_CTRL, value);
+
+	value = msm_dp_read_link(panel, MMSS_DP_FLUSH);
+	msm_dp_write_link(panel, MMSS_DP_FLUSH, value | BIT(2) | BIT(0));
 }
 
 static void msm_dp_panel_update_stream_sdp(struct msm_dp_panel_private *panel)

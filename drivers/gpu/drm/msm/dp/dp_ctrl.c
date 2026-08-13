@@ -17,6 +17,7 @@
 #include <linux/string_choices.h>
 
 #include <drm/display/drm_dp_helper.h>
+#include <drm/display/drm_dsc_helper.h>
 #include <drm/drm_device.h>
 #include <drm/drm_fixed.h>
 #include <drm/drm_print.h>
@@ -140,6 +141,7 @@ struct msm_dp_ctrl_private {
 	bool core_clks_on;
 	bool link_clks_on;
 	bool stream_clks_on;
+	bool fec_enabled;
 };
 
 static inline u32 msm_dp_read_ahb(const struct msm_dp_ctrl_private *ctrl, u32 offset)
@@ -330,12 +332,27 @@ static void msm_dp_ctrl_mainlink_enable(struct msm_dp_ctrl_private *ctrl)
 	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, mainlink_ctrl);
 }
 
+static void msm_dp_ctrl_fec_config(struct msm_dp_ctrl_private *ctrl, bool enable)
+{
+	u32 mainlink_ctrl;
+
+	mainlink_ctrl = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
+	if (enable)
+		mainlink_ctrl |= DP_MAINLINK_CTRL_FEC_CONFIG;
+	else
+		mainlink_ctrl &= ~DP_MAINLINK_CTRL_FEC_ENABLE;
+	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, mainlink_ctrl);
+	if (!enable)
+		ctrl->fec_enabled = false;
+}
+
 static void msm_dp_ctrl_mainlink_disable(struct msm_dp_ctrl_private *ctrl)
 {
 	u32 mainlink_ctrl;
 
 	drm_dbg_dp(ctrl->drm_dev, "disable\n");
 
+	msm_dp_ctrl_fec_config(ctrl, false);
 	mainlink_ctrl = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
 	mainlink_ctrl &= ~DP_MAINLINK_CTRL_ENABLE;
 	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, mainlink_ctrl);
@@ -405,6 +422,8 @@ static void msm_dp_ctrl_config_ctrl(struct msm_dp_ctrl_private *ctrl)
 
 	tbd = msm_dp_link_get_test_bits_depth(ctrl->link,
 			ctrl->panel->msm_dp_mode.bpp);
+	if (ctrl->panel->dsc.enabled)
+		tbd = msm_dp_link_get_test_bits_depth(ctrl->link, 24);
 
 	config |= tbd << DP_CONFIGURATION_CTRL_BPC_SHIFT;
 
@@ -453,6 +472,8 @@ static void msm_dp_ctrl_configure_source_params(struct msm_dp_ctrl_private *ctrl
 	msm_dp_ctrl_config_ctrl(ctrl);
 
 	test_bits_depth = msm_dp_link_get_test_bits_depth(ctrl->link, ctrl->panel->msm_dp_mode.bpp);
+	if (ctrl->panel->dsc.enabled)
+		test_bits_depth = msm_dp_link_get_test_bits_depth(ctrl->link, 24);
 	colorimetry_cfg = msm_dp_link_get_colorimetry_config(ctrl->link);
 
 	misc_val = msm_dp_read_link(ctrl, REG_DP_MISC1_MISC0);
@@ -1251,11 +1272,13 @@ static void msm_dp_ctrl_calc_tu_parameters(struct msm_dp_ctrl_private *ctrl,
 	in.nlanes = ctrl->link->link_params.num_lanes;
 	in.bpp = ctrl->panel->msm_dp_mode.bpp;
 	in.pixel_enc = ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420 ? 420 : 444;
-	in.dsc_en = 0;
+	in.dsc_en = ctrl->panel->dsc.enabled;
 	in.async_en = 0;
-	in.fec_en = 0;
-	in.num_of_dsc_slices = 0;
-	in.compress_ratio = 100;
+	in.fec_en = ctrl->panel->fec_capable;
+	in.num_of_dsc_slices = ctrl->panel->dsc.drm.slice_count;
+	in.compress_ratio = ctrl->panel->dsc.enabled ?
+		mult_frac(100, ctrl->panel->msm_dp_mode.bpp,
+			  drm_dsc_get_bpp_int(&ctrl->panel->dsc.drm)) : 100;
 
 	_dp_ctrl_calc_tu(ctrl, &in, tu_table);
 }
@@ -1298,6 +1321,44 @@ static int msm_dp_ctrl_wait4video_ready(struct msm_dp_ctrl_private *ctrl)
 		ret = -ETIMEDOUT;
 	}
 	return ret;
+}
+
+static void msm_dp_ctrl_fec_setup(struct msm_dp_ctrl_private *ctrl)
+{
+	u8 fec_status = 0;
+	int i;
+
+	if (!ctrl->panel->fec_capable || ctrl->fec_enabled)
+		return;
+
+	for (i = 0; i < 3; i++) {
+		msm_dp_ctrl_fec_config(ctrl, true);
+		usleep_range(900, 1000);
+
+		if (drm_dp_dpcd_readb(ctrl->aux, DP_FEC_STATUS, &fec_status) == 1 &&
+		    (fec_status & DP_FEC_DECODE_EN_DETECTED)) {
+			ctrl->fec_enabled = true;
+			return;
+		}
+	}
+
+	drm_warn(ctrl->drm_dev, "sink did not detect FEC enable\n");
+}
+
+static void msm_dp_ctrl_sink_dsc_enable(struct msm_dp_ctrl_private *ctrl)
+{
+	int ret;
+
+	if (!ctrl->panel->dsc.enabled)
+		return;
+
+	ret = drm_dp_dpcd_writeb(ctrl->aux, DP_DSC_ENABLE,
+				 DP_DECOMPRESSION_EN);
+	if (ret == 1)
+		return;
+
+	drm_warn(ctrl->drm_dev, "failed to enable sink DSC: %d\n",
+		 ret < 0 ? ret : -EIO);
 }
 
 static int msm_dp_ctrl_set_vx_px(struct msm_dp_ctrl_private *ctrl,
@@ -1629,6 +1690,7 @@ static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
 	struct msm_dp_link_info link_info = {0};
 
 	msm_dp_ctrl_config_ctrl(ctrl);
+	msm_dp_ctrl_fec_config(ctrl, false);
 
 	link_info.num_lanes = ctrl->link->link_params.num_lanes;
 	link_info.rate = ctrl->link->link_params.rate;
@@ -1684,6 +1746,11 @@ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
 
 	if (ctrl->link->sink_request & DP_TEST_LINK_PHY_TEST_PATTERN)
 		return ret;
+
+	if (ctrl->panel->fec_capable &&
+	    drm_dp_dpcd_writeb(ctrl->aux, DP_FEC_CONFIGURATION,
+			       DP_FEC_READY) != 1)
+		drm_warn(ctrl->drm_dev, "failed to mark sink FEC ready\n");
 
 	/*
 	 * As part of previous calls, DP controller state might have
@@ -2013,6 +2080,8 @@ static int msm_dp_ctrl_link_maintenance(struct msm_dp_ctrl_private *ctrl)
 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, DP_STATE_CTRL_SEND_VIDEO);
 
 	ret = msm_dp_ctrl_wait4video_ready(ctrl);
+	if (!ret)
+		msm_dp_ctrl_fec_setup(ctrl);
 end:
 	return ret;
 }
@@ -2545,6 +2614,10 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
 	if (ret)
 		return ret;
 
+	msm_dp_ctrl_fec_setup(ctrl);
+	msm_dp_ctrl_sink_dsc_enable(ctrl);
+	msm_dp_panel_config_dsc(ctrl->panel, true);
+
 	mainlink_ready = msm_dp_ctrl_mainlink_ready(ctrl);
 	drm_dbg_dp(ctrl->drm_dev,
 		"mainlink %s\n", mainlink_ready ? "READY" : "NOT READY");
@@ -2562,6 +2635,8 @@ void msm_dp_ctrl_off_link_stream(struct msm_dp_ctrl *msm_dp_ctrl)
 	phy = ctrl->phy;
 
 	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
+	msm_dp_panel_config_dsc(ctrl->panel, false);
+	msm_dp_panel_ack_dsc_dto(ctrl->panel);
 
 	/* set dongle to D3 (power off) mode */
 	msm_dp_link_psm_config(ctrl->link, &ctrl->panel->link_info, true);
@@ -2592,6 +2667,8 @@ void msm_dp_ctrl_off(struct msm_dp_ctrl *msm_dp_ctrl)
 	phy = ctrl->phy;
 
 	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
+	msm_dp_panel_config_dsc(ctrl->panel, false);
+	msm_dp_panel_ack_dsc_dto(ctrl->panel);
 
 	msm_dp_ctrl_mainlink_disable(ctrl);
 
