@@ -8,6 +8,8 @@
 #include "dp_utils.h"
 
 #include <drm/drm_connector.h>
+#include <drm/display/drm_dp_mst_helper.h>
+#include <drm/display/drm_hdmi_helper.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_of.h>
 #include <drm/drm_print.h>
@@ -26,6 +28,7 @@ struct msm_dp_panel_private {
 	struct msm_dp_link *link;
 	void __iomem *link_base;
 	void __iomem *p0_base;
+	u32 colorspace;
 	bool panel_on;
 };
 
@@ -482,7 +485,14 @@ void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel)
 	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, 0x0);
 }
 
-static void msm_dp_panel_send_vsc_sdp(struct msm_dp_panel_private *panel, struct dp_sdp *vsc_sdp)
+static void msm_dp_panel_update_stream_sdp(struct msm_dp_panel_private *panel)
+{
+	msm_dp_write_link(panel, MMSS_DP_SDP_CFG3, UPDATE_SDP);
+	msm_dp_write_link(panel, MMSS_DP_SDP_CFG3, 0);
+}
+
+static void msm_dp_panel_send_vsc_sdp(struct msm_dp_panel_private *panel,
+				      const struct dp_sdp *vsc_sdp)
 {
 	u32 header[2];
 	u32 val;
@@ -511,7 +521,8 @@ static void msm_dp_panel_update_sdp(struct msm_dp_panel_private *panel)
 	}
 }
 
-void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel, struct dp_sdp *vsc_sdp)
+void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel,
+				 const struct dp_sdp *vsc_sdp)
 {
 	struct msm_dp_panel_private *panel =
 		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
@@ -540,6 +551,218 @@ void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel, struct dp_sd
 	msm_dp_panel_update_sdp(panel);
 }
 
+static u8 msm_dp_panel_get_misc_colorimetry(struct msm_dp_panel_private *panel)
+{
+	int colorimetry;
+
+	colorimetry = msm_dp_link_get_colorimetry_config(panel->link);
+	if (colorimetry > 0)
+		return colorimetry << DP_MISC0_COLORIMETRY_CFG_SHIFT;
+
+	switch (panel->colorspace) {
+	case DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65:
+	case DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER:
+		return 0x0e;
+	case DRM_MODE_COLORIMETRY_RGB_WIDE_FIXED:
+		return 0x06;
+	case DRM_MODE_COLORIMETRY_RGB_WIDE_FLOAT:
+		return 0x16;
+	case DRM_MODE_COLORIMETRY_OPRGB:
+		return 0x18;
+	default:
+		return 0;
+	}
+}
+
+static int msm_dp_panel_config_colorspace(struct msm_dp_panel *msm_dp_panel)
+{
+	struct msm_dp_panel_private *panel = container_of(msm_dp_panel,
+						 struct msm_dp_panel_private,
+						 msm_dp_panel);
+	struct drm_dp_vsc_sdp vsc = {
+		.sdp_type = DP_SDP_VSC,
+		.revision = 0x05,
+		.length = 0x13,
+		.pixelformat = DP_PIXELFORMAT_RGB,
+		.colorimetry = DP_COLORIMETRY_DEFAULT,
+		.bpc = msm_dp_panel->msm_dp_mode.bpp / 3,
+		.dynamic_range = DP_DYNAMIC_RANGE_VESA,
+		.content_type = DP_CONTENT_TYPE_GRAPHICS,
+	};
+	struct dp_sdp sdp = {};
+	int colorimetry;
+	ssize_t len;
+	u32 misc;
+
+	if (msm_dp_panel->msm_dp_mode.out_fmt_is_yuv_420)
+		return 0;
+
+	if (!msm_dp_panel->vsc_sdp_supported) {
+		misc = msm_dp_read_link(panel, REG_DP_MISC1_MISC0);
+		misc &= ~(0x0f << DP_MISC0_COLORIMETRY_CFG_SHIFT);
+		misc |= msm_dp_panel_get_misc_colorimetry(panel);
+		msm_dp_write_link(panel, REG_DP_MISC1_MISC0, misc);
+		return 0;
+	}
+
+	colorimetry = msm_dp_link_get_colorimetry_config(panel->link);
+	if (colorimetry > 0) {
+		vsc.dynamic_range = DP_DYNAMIC_RANGE_CTA;
+	} else {
+		switch (panel->colorspace) {
+		case DRM_MODE_COLORIMETRY_BT2020_RGB:
+			vsc.colorimetry = DP_COLORIMETRY_BT2020_RGB;
+			vsc.dynamic_range = DP_DYNAMIC_RANGE_CTA;
+			break;
+		case DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65:
+		case DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER:
+			vsc.colorimetry = DP_COLORIMETRY_DCI_P3_RGB;
+			break;
+		default:
+			break;
+		}
+	}
+
+	len = drm_dp_vsc_sdp_pack(&vsc, &sdp);
+	if (len < 0)
+		return len;
+
+	msm_dp_panel_enable_vsc_sdp(msm_dp_panel, &sdp);
+	msm_dp_panel_update_stream_sdp(panel);
+
+	return 0;
+}
+
+int msm_dp_panel_set_colorspace(struct msm_dp_panel *msm_dp_panel,
+				u32 colorspace)
+{
+	struct msm_dp_panel_private *panel = container_of(msm_dp_panel,
+						 struct msm_dp_panel_private,
+						 msm_dp_panel);
+
+	panel->colorspace = colorspace;
+
+	if (!panel->panel_on)
+		return 0;
+
+	return msm_dp_panel_config_colorspace(msm_dp_panel);
+}
+
+static void msm_dp_panel_write_stream_sdp(struct msm_dp_panel_private *panel,
+					  const struct dp_sdp *sdp,
+					  u32 base)
+{
+	u32 header[2];
+	int i;
+
+	msm_dp_utils_pack_sdp_header(&sdp->sdp_header, header);
+	msm_dp_write_link(panel, base, header[0]);
+	msm_dp_write_link(panel, base + 4, header[1]);
+
+	for (i = 0; i < sizeof(sdp->db); i += 4) {
+		u32 value = sdp->db[i] |
+			(sdp->db[i + 1] << 8) |
+			(sdp->db[i + 2] << 16) |
+			(sdp->db[i + 3] << 24);
+
+		msm_dp_write_link(panel, base + 8 + i, value);
+	}
+}
+
+void msm_dp_panel_config_spd(struct msm_dp_panel *msm_dp_panel)
+{
+	static const u8 vendor_name[8] = {
+		'Q', 'u', 'a', 'l', 'c', 'o', 'm', 'm',
+	};
+	static const u8 product_description[16] = "Snapdragon";
+	struct msm_dp_panel_private *panel;
+	struct dp_sdp sdp = {};
+	u32 cfg, cfg2;
+
+	if (!msm_dp_panel)
+		return;
+
+	panel = container_of(msm_dp_panel, struct msm_dp_panel_private,
+			     msm_dp_panel);
+	sdp.sdp_header.HB1 = HDMI_INFOFRAME_TYPE_SPD;
+	sdp.sdp_header.HB2 = 0x1b;
+	sdp.sdp_header.HB3 = 0x12 << 2;
+	memcpy(sdp.db, vendor_name, sizeof(vendor_name));
+	memcpy(sdp.db + sizeof(vendor_name), product_description,
+	       sizeof(product_description));
+
+	msm_dp_panel_write_stream_sdp(panel, &sdp, MMSS_DP_GENERIC1_0);
+
+	cfg = msm_dp_read_link(panel, MMSS_DP_SDP_CFG);
+	cfg2 = msm_dp_read_link(panel, MMSS_DP_SDP_CFG2);
+	msm_dp_write_link(panel, MMSS_DP_SDP_CFG, cfg | GEN1_SDP_EN);
+	msm_dp_write_link(panel, MMSS_DP_SDP_CFG2,
+			  cfg2 | GENERIC1_SDPSIZE_VALID);
+	msm_dp_panel_update_stream_sdp(panel);
+}
+
+int msm_dp_panel_config_hdr(struct msm_dp_panel *msm_dp_panel,
+			    const struct drm_connector_state *conn_state,
+			    bool flush)
+{
+	struct msm_dp_panel_private *panel;
+	struct hdmi_drm_infoframe frame;
+	struct dp_sdp sdp = {};
+	u8 buffer[HDMI_INFOFRAME_HEADER_SIZE + HDMI_DRM_INFOFRAME_SIZE];
+	u32 cfg, cfg2;
+	ssize_t len;
+	int ret;
+
+	if (!msm_dp_panel)
+		return -EINVAL;
+
+	panel = container_of(msm_dp_panel, struct msm_dp_panel_private,
+			     msm_dp_panel);
+	cfg = msm_dp_read_link(panel, MMSS_DP_SDP_CFG);
+	cfg2 = msm_dp_read_link(panel, MMSS_DP_SDP_CFG2);
+
+	if (!conn_state || !conn_state->hdr_output_metadata) {
+		if (!(cfg & GEN2_SDP_EN))
+			return 0;
+
+		cfg &= ~GEN2_SDP_EN;
+		cfg2 &= ~GENERIC2_SDPSIZE_VALID;
+		msm_dp_write_link(panel, MMSS_DP_SDP_CFG, cfg);
+		msm_dp_write_link(panel, MMSS_DP_SDP_CFG2, cfg2);
+		if (flush)
+			msm_dp_panel_update_stream_sdp(panel);
+		return 0;
+	}
+
+	ret = drm_hdmi_infoframe_set_hdr_metadata(&frame, conn_state);
+	if (ret)
+		return ret;
+
+	len = hdmi_drm_infoframe_pack_only(&frame, buffer, sizeof(buffer));
+	if (len != HDMI_INFOFRAME_HEADER_SIZE + HDMI_DRM_INFOFRAME_SIZE)
+		return len < 0 ? len : -EINVAL;
+
+	sdp.sdp_header.HB0 = 0;
+	sdp.sdp_header.HB1 = frame.type;
+	sdp.sdp_header.HB2 = 0x1D;
+	sdp.sdp_header.HB3 = 0x13 << 2;
+	sdp.db[0] = frame.version;
+	sdp.db[1] = frame.length;
+	BUILD_BUG_ON(sizeof(sdp.db) < HDMI_DRM_INFOFRAME_SIZE + 2);
+	memcpy(&sdp.db[2], &buffer[HDMI_INFOFRAME_HEADER_SIZE],
+	       HDMI_DRM_INFOFRAME_SIZE);
+
+	cfg |= GEN2_SDP_EN;
+	cfg2 |= GENERIC2_SDPSIZE_VALID;
+	msm_dp_write_link(panel, MMSS_DP_SDP_CFG, cfg);
+	msm_dp_write_link(panel, MMSS_DP_SDP_CFG2, cfg2);
+	msm_dp_panel_write_stream_sdp(panel, &sdp, MMSS_DP_GENERIC2_0);
+	if (flush)
+		msm_dp_panel_update_stream_sdp(panel);
+
+	return 0;
+}
+
 void msm_dp_panel_disable_vsc_sdp(struct msm_dp_panel *msm_dp_panel)
 {
 	struct msm_dp_panel_private *panel =
@@ -565,6 +788,7 @@ void msm_dp_panel_disable_vsc_sdp(struct msm_dp_panel *msm_dp_panel)
 	msm_dp_write_link(panel, REG_DP_MISC1_MISC0, misc);
 
 	msm_dp_panel_update_sdp(panel);
+	panel->panel_on = false;
 }
 
 static int msm_dp_panel_setup_vsc_sdp_yuv_420(struct msm_dp_panel *msm_dp_panel)

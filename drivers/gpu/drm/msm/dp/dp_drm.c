@@ -15,6 +15,42 @@
 #include "dp_audio.h"
 #include "dp_drm.h"
 
+static int msm_dp_bridge_atomic_check(struct drm_bridge *bridge,
+				      struct drm_bridge_state *bridge_state,
+				      struct drm_crtc_state *crtc_state,
+				      struct drm_connector_state *conn_state)
+{
+	struct drm_connector_state *old_conn_state;
+
+	old_conn_state =
+		drm_atomic_get_old_connector_state(conn_state->state,
+						   conn_state->connector);
+	if (crtc_state && conn_state->crtc &&
+	    drm_mode_is_420_only(&conn_state->connector->display_info,
+				 &crtc_state->adjusted_mode) &&
+	    (conn_state->colorspace != DRM_MODE_COLORIMETRY_DEFAULT ||
+	     conn_state->hdr_output_metadata))
+		return -EINVAL;
+	if (old_conn_state && crtc_state && conn_state->crtc &&
+	    (!drm_connector_atomic_hdr_metadata_equal(old_conn_state, conn_state) ||
+	     old_conn_state->colorspace != conn_state->colorspace))
+		crtc_state->mode_changed = true;
+
+	return 0;
+}
+
+static void msm_dp_attach_metadata_properties(struct drm_connector *connector)
+{
+	u32 colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
+			  BIT(DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65);
+
+	if (drm_mode_create_dp_colorspace_property(connector, colorspaces))
+		return;
+
+	drm_connector_attach_colorspace_property(connector);
+	drm_connector_attach_hdr_output_metadata_property(connector);
+}
+
 /**
  * msm_dp_bridge_get_modes - callback to add drm modes via drm_mode_probed_add()
  * @bridge: Poiner to drm bridge
@@ -60,6 +96,7 @@ static const struct drm_bridge_funcs msm_dp_bridge_ops = {
 	.mode_valid   = msm_dp_bridge_mode_valid,
 	.get_modes    = msm_dp_bridge_get_modes,
 	.detect       = msm_dp_bridge_detect,
+	.atomic_check = msm_dp_bridge_atomic_check,
 	.hpd_enable   = msm_dp_bridge_hpd_enable,
 	.hpd_disable  = msm_dp_bridge_hpd_disable,
 	.hpd_notify   = msm_dp_bridge_hpd_notify,
@@ -322,8 +359,10 @@ struct drm_connector *msm_dp_drm_connector_init(struct msm_dp *msm_dp_display,
 	if (IS_ERR(connector))
 		return connector;
 
-	if (!msm_dp_display->is_edp)
+	if (!msm_dp_display->is_edp) {
 		drm_connector_attach_dp_subconnector_property(connector);
+		msm_dp_attach_metadata_properties(connector);
+	}
 
 	return connector;
 }

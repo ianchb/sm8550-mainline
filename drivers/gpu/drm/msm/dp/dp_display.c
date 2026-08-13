@@ -1359,9 +1359,19 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
 	int rc = 0;
 	struct msm_dp_display_private *msm_dp_display;
+	struct drm_connector_state *old_conn_state;
+	struct drm_connector_state *conn_state;
+	bool colorspace_changed = false;
 	bool force_link_train = false;
+	int hdr_rc;
+	int colorspace_rc;
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+	conn_state = drm_atomic_get_new_connector_state(state, dp->connector);
+	old_conn_state = drm_atomic_get_old_connector_state(state, dp->connector);
+	if (old_conn_state && conn_state)
+		colorspace_changed = old_conn_state->colorspace !=
+				     conn_state->colorspace;
 	if (!msm_dp_display->msm_dp_mode.drm_mode.clock) {
 		DRM_ERROR("invalid params\n");
 		return;
@@ -1402,6 +1412,24 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 	if (rc) {
 		DRM_ERROR("DP display post enable failed, rc=%d\n", rc);
 		msm_dp_display_disable(msm_dp_display);
+	}
+	if (!rc) {
+		msm_dp_panel_config_spd(msm_dp_display->panel);
+		hdr_rc = msm_dp_panel_config_hdr(msm_dp_display->panel,
+						 conn_state,
+						 !colorspace_changed);
+		if (hdr_rc)
+			drm_dbg_dp(dp->drm_dev,
+				   "failed to configure SST HDR: %d\n", hdr_rc);
+
+		if (colorspace_changed) {
+			colorspace_rc = msm_dp_panel_set_colorspace(
+				msm_dp_display->panel, conn_state->colorspace);
+			if (colorspace_rc)
+				drm_dbg_dp(dp->drm_dev,
+					   "failed to configure SST colorspace: %d\n",
+					   colorspace_rc);
+		}
 	}
 
 	drm_dbg_dp(dp->drm_dev, "type=%d Done\n", dp->connector_type);
