@@ -153,6 +153,14 @@ static int ps5169_sw_set(struct typec_switch_dev *sw, enum typec_orientation ori
 	if (ps5169->orientation != orientation) {
 		ps5169->orientation = orientation;
 
+		/* USB-only connections do not send mode updates to retimers. */
+		if (orientation == TYPEC_ORIENTATION_NONE) {
+			ps5169->mode = TYPEC_STATE_SAFE;
+			ps5169->svid = 0;
+		} else if (ps5169->mode == TYPEC_STATE_SAFE) {
+			ps5169->mode = TYPEC_STATE_USB;
+		}
+
 		ret = ps5169_set(ps5169);
 	}
 
