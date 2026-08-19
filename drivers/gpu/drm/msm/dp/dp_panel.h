@@ -13,6 +13,7 @@
 #include "dp_link.h"
 
 struct edid;
+struct drm_connector_state;
 
 struct msm_dp_display_mode {
 	struct drm_display_mode drm_mode;
@@ -62,6 +63,9 @@ void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel);
 
 void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel, struct dp_sdp *vsc_sdp);
 void msm_dp_panel_disable_vsc_sdp(struct msm_dp_panel *msm_dp_panel);
+int msm_dp_panel_config_hdr(struct msm_dp_panel *msm_dp_panel,
+			    const struct drm_connector_state *conn_state);
+void msm_dp_panel_apply_hdr(struct msm_dp_panel *msm_dp_panel);
 
 /**
  * is_link_rate_valid() - validates the link rate
