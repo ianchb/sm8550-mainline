@@ -9,6 +9,7 @@
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
 #include <drm/drm_crtc.h>
+#include <linux/hdmi.h>
 
 #include "msm_drv.h"
 #include "msm_kms.h"
@@ -49,10 +50,57 @@ static void msm_dp_bridge_debugfs_init(struct drm_bridge *bridge, struct dentry 
 	msm_dp_display_debugfs_init(dp, root, false);
 }
 
+static int msm_dp_bridge_atomic_check(struct drm_bridge *drm_bridge,
+				      struct drm_bridge_state *bridge_state,
+				      struct drm_crtc_state *crtc_state,
+				      struct drm_connector_state *conn_state)
+{
+	struct msm_dp *dp = to_dp_bridge(drm_bridge)->msm_dp_display;
+	struct drm_connector_state *old_conn_state;
+	struct hdr_output_metadata *hdr_metadata;
+	bool vsc_sdp_supported = msm_dp_display_vsc_sdp_supported(dp);
+	bool yuv_420;
+
+	yuv_420 = conn_state->crtc &&
+		drm_mode_is_420_only(&conn_state->connector->display_info,
+				     &crtc_state->adjusted_mode);
+
+	if (yuv_420 &&
+	    (conn_state->colorspace != DRM_MODE_COLORIMETRY_DEFAULT ||
+	     conn_state->hdr_output_metadata))
+		return -EINVAL;
+
+	if (conn_state->crtc && !vsc_sdp_supported &&
+	    (conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB ||
+	     conn_state->hdr_output_metadata))
+		return -EOPNOTSUPP;
+
+	if (conn_state->hdr_output_metadata) {
+		hdr_metadata = conn_state->hdr_output_metadata->data;
+		if (hdr_metadata->metadata_type != HDMI_STATIC_METADATA_TYPE1 ||
+		    hdr_metadata->hdmi_metadata_type1.metadata_type !=
+						HDMI_STATIC_METADATA_TYPE1)
+			return -EINVAL;
+	}
+
+	old_conn_state =
+		drm_atomic_get_old_connector_state(conn_state->state,
+						   conn_state->connector);
+	if (!old_conn_state)
+		return 0;
+
+	if (old_conn_state->colorspace != conn_state->colorspace ||
+	    !drm_connector_atomic_hdr_metadata_equal(old_conn_state, conn_state))
+		crtc_state->mode_changed = true;
+
+	return 0;
+}
+
 static const struct drm_bridge_funcs msm_dp_bridge_ops = {
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state   = drm_atomic_helper_bridge_destroy_state,
 	.atomic_reset           = drm_atomic_helper_bridge_reset,
+	.atomic_check           = msm_dp_bridge_atomic_check,
 	.atomic_enable          = msm_dp_bridge_atomic_enable,
 	.atomic_disable         = msm_dp_bridge_atomic_disable,
 	.atomic_post_disable    = msm_dp_bridge_atomic_post_disable,
@@ -314,16 +362,29 @@ int msm_dp_bridge_init(struct msm_dp *msm_dp_display, struct drm_device *dev,
 
 /* connector initialization */
 struct drm_connector *msm_dp_drm_connector_init(struct msm_dp *msm_dp_display,
-					    struct drm_encoder *encoder)
+						    struct drm_encoder *encoder)
 {
 	struct drm_connector *connector = NULL;
+	u32 colorspaces;
+	int ret;
 
 	connector = drm_bridge_connector_init(msm_dp_display->drm_dev, encoder);
 	if (IS_ERR(connector))
 		return connector;
 
-	if (!msm_dp_display->is_edp)
+	if (!msm_dp_display->is_edp) {
 		drm_connector_attach_dp_subconnector_property(connector);
+
+		colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
+			      BIT(DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65) |
+			      BIT(DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER);
+		ret = drm_mode_create_dp_colorspace_property(connector, colorspaces);
+		if (ret)
+			return ERR_PTR(ret);
+
+		drm_connector_attach_colorspace_property(connector);
+		drm_connector_attach_hdr_output_metadata_property(connector);
+	}
 
 	return connector;
 }

@@ -1289,10 +1289,19 @@ bool msm_dp_is_yuv_420_enabled(const struct msm_dp *msm_dp_display,
 	return dp->panel->vsc_sdp_supported && drm_mode_is_420_only(info, mode);
 }
 
+bool msm_dp_display_vsc_sdp_supported(const struct msm_dp *msm_dp_display)
+{
+	const struct msm_dp_display_private *dp;
+
+	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+
+	return dp->panel->vsc_sdp_supported;
+}
+
 bool msm_dp_needs_periph_flush(const struct msm_dp *msm_dp_display,
 			       const struct drm_display_mode *mode)
 {
-	return msm_dp_is_yuv_420_enabled(msm_dp_display, mode);
+	return msm_dp_display_vsc_sdp_supported(msm_dp_display);
 }
 
 bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
@@ -1359,11 +1368,21 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
 	int rc = 0;
 	struct msm_dp_display_private *msm_dp_display;
+	struct drm_connector_state *conn_state;
 	bool force_link_train = false;
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+	conn_state = drm_atomic_get_new_connector_state(state, dp->connector);
+	if (!conn_state)
+		conn_state = dp->connector->state;
 	if (!msm_dp_display->msm_dp_mode.drm_mode.clock) {
 		DRM_ERROR("invalid params\n");
+		return;
+	}
+
+	rc = msm_dp_panel_config_hdr(msm_dp_display->panel, conn_state);
+	if (rc) {
+		DRM_ERROR("Failed to configure HDR state, rc=%d\n", rc);
 		return;
 	}
 
