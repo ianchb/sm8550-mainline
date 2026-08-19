@@ -1343,10 +1343,19 @@ void __exit msm_dp_unregister(void)
 	platform_driver_unregister(&msm_dp_display_driver);
 }
 
+bool msm_dp_display_vsc_sdp_supported(const struct msm_dp *msm_dp_display)
+{
+	const struct msm_dp_display_private *dp;
+
+	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+
+	return dp->panel->vsc_sdp_supported;
+}
+
 bool msm_dp_needs_periph_flush(const struct msm_dp *msm_dp_display,
 			       const struct drm_display_mode *mode)
 {
-	return drm_mode_is_420_only(&msm_dp_display->connector->display_info, mode);
+	return msm_dp_display_vsc_sdp_supported(msm_dp_display);
 }
 
 bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
@@ -1410,8 +1419,10 @@ void msm_dp_display_atomic_pre_enable(struct msm_dp *msm_dp_display,
 				      struct drm_atomic_commit *state)
 {
 	struct msm_dp_display_private *dp;
+	struct drm_connector_state *conn_state;
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *crtc_state;
+	int rc;
 
 	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
 
@@ -1419,6 +1430,16 @@ void msm_dp_display_atomic_pre_enable(struct msm_dp *msm_dp_display,
 	if (!crtc)
 		return;
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+
+	conn_state = drm_atomic_get_new_connector_state(state, msm_dp_display->connector);
+	if (!conn_state)
+		conn_state = msm_dp_display->connector->state;
+
+	rc = msm_dp_panel_config_hdr(dp->panel, conn_state);
+	if (rc) {
+		DRM_ERROR("Failed to configure HDR state, rc=%d\n", rc);
+		return;
+	}
 
 	/*
 	 * The DPU encoder's .atomic_enable() reads the mode's YUV420 / wide bus
@@ -1450,6 +1471,9 @@ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
 	if (rc) {
 		DRM_ERROR("DP display post enable failed, rc=%d\n", rc);
 		msm_dp_display_disable(dp, dp->panel);
+	} else {
+		/* Commit HDR SDP after the stream and DP power have come up. */
+		msm_dp_panel_apply_hdr(dp->panel);
 	}
 
 	drm_dbg_dp(msm_dp_display->drm_dev, "type=%d Done\n", msm_dp_display->connector_type);
