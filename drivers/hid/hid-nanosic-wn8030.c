@@ -62,6 +62,7 @@ struct nanosic_wn8030 {
 	bool capslock_enabled;
 	bool micmute_key_down;
 	struct led_classdev micmute_led;
+	struct led_classdev kbd_backlight_led;
 
 	/* Keyboard accelerometer and userspace angle policy. */
 	struct miscdevice hinge_misc;
@@ -390,6 +391,31 @@ static int nanosic_wn8030_set_indicator_led(struct nanosic_wn8030 *nanosic, u8 s
 	return regmap_bulk_write(nanosic->regmap, 0x5c, buf, sizeof(buf));
 }
 
+static int nanosic_wn8030_set_kbd_backlight(struct nanosic_wn8030 *nanosic,
+						    u8 brightness)
+{
+	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4E, 0x31,
+					0x80, 0x38, 0x23, 0x01 };
+
+	buf[8] = brightness;
+	buf[9] = nanosic_wn8030_checksum8(&buf[2], 7);
+
+	return regmap_bulk_write(nanosic->regmap, 0x5c, buf, sizeof(buf));
+}
+
+static int nanosic_wn8030_sync_kbd_backlight(struct nanosic_wn8030 *nanosic)
+{
+	u8 brightness;
+
+	if (!READ_ONCE(nanosic->keyboard_attached) ||
+	    READ_ONCE(nanosic->suspended))
+		return 0;
+
+	brightness = READ_ONCE(nanosic->input_enabled) ?
+			READ_ONCE(nanosic->kbd_backlight_led.brightness) : 0;
+	return nanosic_wn8030_set_kbd_backlight(nanosic, brightness);
+}
+
 static int nanosic_wn8030_set_caps_led(struct nanosic_wn8030 *nanosic, bool enable)
 {
 	WRITE_ONCE(nanosic->capslock_enabled, enable);
@@ -420,6 +446,23 @@ static int nanosic_wn8030_micmute_led_set(struct led_classdev *led_cdev,
 	mutex_lock(&nanosic->conn_mutex);
 	ret = nanosic_wn8030_sync_micmute_led(nanosic,
 					      brightness != LED_OFF);
+	mutex_unlock(&nanosic->conn_mutex);
+
+	return ret;
+}
+
+static int nanosic_wn8030_kbd_backlight_set(struct led_classdev *led_cdev,
+						    enum led_brightness brightness)
+{
+	struct nanosic_wn8030 *nanosic =
+			container_of(led_cdev, struct nanosic_wn8030, kbd_backlight_led);
+	int ret = 0;
+
+	if (brightness > 100)
+		return -EINVAL;
+
+	mutex_lock(&nanosic->conn_mutex);
+	ret = nanosic_wn8030_sync_kbd_backlight(nanosic);
 	mutex_unlock(&nanosic->conn_mutex);
 
 	return ret;
@@ -661,6 +704,7 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
 				nanosic_wn8030_set_indicator_led(nanosic, 0xFC);
 				nanosic_wn8030_set_indicator_led(nanosic, 0xF3);
 			}
+			nanosic_wn8030_sync_kbd_backlight(nanosic);
 			schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
 			notify_plugin = true;
 			plugin_attached = true;
@@ -730,7 +774,14 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
 							      msecs_to_jiffies(5000)) <= 0) {
 			dev_err(nanosic->dev, "timeout waiting for keyboard auth token\n");
 		} else {
-			nanosic_wn8030_xm_auth_s5t1(nanosic, nanosic->auth_token);
+			int ret;
+
+			ret = nanosic_wn8030_xm_auth_s5t1(nanosic, nanosic->auth_token);
+			if (!ret) {
+				mutex_lock(&nanosic->conn_mutex);
+				nanosic_wn8030_sync_kbd_backlight(nanosic);
+				mutex_unlock(&nanosic->conn_mutex);
+			}
 		}
 	}
 }
@@ -746,6 +797,7 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
 	 */
 	if (READ_ONCE(nanosic->suspended)) {
 		WRITE_ONCE(nanosic->suspended, false);
+		schedule_work(&nanosic->input_state_work);
 		return IRQ_HANDLED;
 	}
 
@@ -1073,6 +1125,7 @@ static void nanosic_wn8030_input_state_work(struct work_struct *work)
 		nanosic_wn8030_set_indicator_led(nanosic, 0xFC);
 		nanosic_wn8030_set_indicator_led(nanosic, 0xF3);
 	}
+	nanosic_wn8030_sync_kbd_backlight(nanosic);
 
 out:
 	mutex_unlock(&nanosic->conn_mutex);
@@ -1464,10 +1517,18 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	if (ret)
 		goto err_misc;
 
+	nanosic->kbd_backlight_led.name = "nanosic::kbd_backlight";
+	nanosic->kbd_backlight_led.max_brightness = 100;
+	nanosic->kbd_backlight_led.brightness_set_blocking =
+		nanosic_wn8030_kbd_backlight_set;
+	ret = devm_led_classdev_register(nanosic->dev, &nanosic->kbd_backlight_led);
+	if (ret)
+		goto err_micmute_led;
+
 	ret = input_register_handler(&nanosic->hall_handler);
 	if (ret) {
 		dev_err(nanosic->dev, "failed to register hall state handler\n");
-		goto err_led;
+		goto err_kbd_backlight_led;
 	}
 
 	ret = devm_request_threaded_irq(&client->dev, client->irq,
@@ -1484,7 +1545,9 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 err_input:
 	input_unregister_handler(&nanosic->hall_handler);
 	cancel_work_sync(&nanosic->input_state_work);
-err_led:
+err_kbd_backlight_led:
+	devm_led_classdev_unregister(nanosic->dev, &nanosic->kbd_backlight_led);
+err_micmute_led:
 	devm_led_classdev_unregister(nanosic->dev, &nanosic->micmute_led);
 err_misc:
 	misc_deregister(&nanosic->hinge_misc);
@@ -1500,6 +1563,7 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
 {
 	struct nanosic_wn8030 *nanosic = i2c_get_clientdata(client);
 
+	devm_led_classdev_unregister(nanosic->dev, &nanosic->kbd_backlight_led);
 	devm_led_classdev_unregister(nanosic->dev, &nanosic->micmute_led);
 	input_unregister_handler(&nanosic->hall_handler);
 	cancel_work_sync(&nanosic->input_state_work);
