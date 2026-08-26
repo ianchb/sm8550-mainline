@@ -49,6 +49,7 @@ static void drm_mode_to_intf_timing_params(
 		const struct drm_display_mode *mode,
 		struct dpu_hw_intf_timing_params *timing)
 {
+	u32 extra_width = 0;
 	memset(timing, 0, sizeof(*timing));
 
 	if ((mode->htotal < mode->hsync_end)
@@ -113,11 +114,9 @@ static void drm_mode_to_intf_timing_params(
 		timing->v_front_porch = 0;
 	}
 
-	/*
-	 * for DP, divide the horizonal parameters by 2 when
-	 * widebus is enabled
-	 */
-	if (phys_enc->hw_intf->cap->type == INTF_DP && timing->wide_bus_en) {
+	/* DP DSC uses the same two-pixel interface path as wide bus. */
+	if (phys_enc->hw_intf->cap->type == INTF_DP &&
+	    (timing->wide_bus_en || timing->compression_en)) {
 		timing->width = timing->width >> 1;
 		timing->xres = timing->xres >> 1;
 		timing->h_back_porch = timing->h_back_porch >> 1;
@@ -130,17 +129,37 @@ static void drm_mode_to_intf_timing_params(
 	 * timing parameters by compression ratio. bits of 3 components(R/G/B)
 	 * is compressed into bits of 1 pixel.
 	 */
-	if (phys_enc->hw_intf->cap->type != INTF_DP && timing->compression_en) {
+	if (timing->compression_en) {
 		struct drm_dsc_config *dsc =
 		       dpu_encoder_get_dsc_config(phys_enc->parent);
 		/*
 		 * TODO: replace drm_dsc_get_bpp_int with logic to handle
 		 * fractional part if there is fraction
 		 */
-		timing->width = timing->width * drm_dsc_get_bpp_int(dsc) /
-				(dsc->bits_per_component * 3);
-		timing->xres = timing->width;
 		timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
+		if (phys_enc->hw_intf->cap->type != INTF_DP) {
+			timing->width = timing->width * drm_dsc_get_bpp_int(dsc) /
+					(dsc->bits_per_component * 3);
+			timing->xres = timing->width;
+		} else {
+			u32 ack_required = DIV_ROUND_UP(timing->dce_bytes_per_line, 6);
+			u32 line_width = dsc->pic_width / 2;
+
+			if (ack_required)
+				timing->extra_dto_cycles = ack_required - 1;
+
+			/* 8bpp DSC uses the 1/3 DTO for 8/10 bpc RGB. */
+			if (drm_dsc_get_bpp_int(dsc) == 8) {
+				u32 last_pclk = line_width % 3;
+				u32 last_ack = ack_required - line_width / 3;
+
+				if (last_ack && last_pclk < 1)
+					extra_width = 1 - last_pclk;
+			}
+
+			timing->width += extra_width;
+			timing->h_back_porch += extra_width;
+		}
 	}
 }
 
@@ -337,6 +356,13 @@ static void dpu_encoder_phys_vid_setup_timing_engine(
 	}
 
 	drm_mode_to_intf_timing_params(phys_enc, &mode, &timing_params);
+	if (timing_params.compression_en)
+		DPU_DEBUG_VIDENC(phys_enc,
+			"DSC timing width=%u xres=%u hbp=%u bytes=%u dto=%u\n",
+			timing_params.width, timing_params.xres,
+			timing_params.h_back_porch,
+			timing_params.dce_bytes_per_line,
+			timing_params.extra_dto_cycles);
 
 	fmt = mdp_get_format(&phys_enc->dpu_kms->base, fmt_fourcc, 0);
 	DPU_DEBUG_VIDENC(phys_enc, "fmt_fourcc 0x%X\n", fmt_fourcc);

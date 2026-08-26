@@ -405,7 +405,8 @@ static void msm_dp_ctrl_config_ctrl_streams(struct msm_dp_ctrl_private *ctrl,
 		config |= DP_CONFIGURATION_CTRL_RGB_YUV; /* YUV420 */
 
 	tbd = msm_dp_link_get_test_bits_depth(ctrl->link,
-					      msm_dp_panel->msm_dp_mode.bpp);
+			msm_dp_panel->msm_dp_mode.dsc_en ? 24 :
+			msm_dp_panel->msm_dp_mode.bpp);
 
 	config |= tbd << DP_CONFIGURATION_CTRL_BPC_SHIFT;
 
@@ -429,7 +430,6 @@ static void msm_dp_ctrl_config_ctrl_link(struct msm_dp_ctrl_private *ctrl,
 	/* Scrambler reset enable */
 	if (drm_dp_alternate_scrambler_reset_cap(dpcd))
 		config |= DP_CONFIGURATION_CTRL_ASSR;
-
 	/* Num of Lanes */
 	config |= ((ctrl->link->link_params.num_lanes - 1)
 			<< DP_CONFIGURATION_CTRL_NUM_OF_LANES_SHIFT);
@@ -958,7 +958,10 @@ static void _dp_ctrl_calc_tu(struct msm_dp_ctrl_private *ctrl,
 	temp_fp = drm_fixp_div(temp2_fp, tu->pclk_fp);
 	tu->extra_buffer_margin = drm_fixp2int_ceil(temp_fp);
 
-	temp1_fp = drm_fixp_from_fraction(tu->bpp, 8);
+	if (in->compress_ratio == 375 && tu->bpp == 30)
+		temp1_fp = drm_fixp_from_fraction(24, 8);
+	else
+		temp1_fp = drm_fixp_from_fraction(tu->bpp, 8);
 	temp2_fp = drm_fixp_mul(tu->pclk_fp, temp1_fp);
 	temp1_fp = drm_fixp_from_fraction(tu->nlanes, 1);
 	temp2_fp = drm_fixp_div(temp2_fp, temp1_fp);
@@ -1276,11 +1279,11 @@ static void msm_dp_ctrl_calc_tu_parameters(struct msm_dp_ctrl_private *ctrl,
 	in.nlanes = ctrl->link->link_params.num_lanes;
 	in.bpp = panel->msm_dp_mode.bpp;
 	in.pixel_enc = panel->msm_dp_mode.out_fmt_is_yuv_420 ? 420 : 444;
-	in.dsc_en = 0;
+	in.dsc_en = panel->msm_dp_mode.dsc_en;
 	in.async_en = 0;
-	in.fec_en = 0;
-	in.num_of_dsc_slices = 0;
-	in.compress_ratio = 100;
+	in.fec_en = in.dsc_en && panel->fec_capable;
+	in.num_of_dsc_slices = in.dsc_en ? panel->dsc.slice_count : 0;
+	in.compress_ratio = in.dsc_en ? (in.bpp * 100) / 8 : 100;
 
 	_dp_ctrl_calc_tu(ctrl, &in, tu_table);
 }
@@ -1713,8 +1716,17 @@ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
 			int *training_step)
 {
 	int ret = 0;
+	u32 val;
 
 	msm_dp_ctrl_mainlink_enable(ctrl);
+
+	val = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
+	val &= ~(DP_MAINLINK_CTRL_FEC_ENABLE | DP_MAINLINK_CTRL_FEC_SEQ_EN |
+		 DP_MAINLINK_CTRL_FEC_FLUSH_EN);
+	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, val);
+
+	if (panel->fec_capable)
+		drm_dp_dpcd_writeb(ctrl->aux, DP_FEC_CONFIGURATION, DP_FEC_READY);
 
 	if (ctrl->link->sink_request & DP_TEST_LINK_PHY_TEST_PATTERN)
 		return ret;
@@ -1728,6 +1740,35 @@ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
 	ret = msm_dp_ctrl_link_train(ctrl, panel, training_step);
 
 	return ret;
+}
+
+static void msm_dp_ctrl_enable_fec_dsc(struct msm_dp_ctrl_private *ctrl,
+				       struct msm_dp_panel *panel)
+{
+	u32 val;
+	u8 status = 0;
+	int retry;
+
+	if (!panel->fec_capable)
+		return;
+
+	if (panel->msm_dp_mode.dsc_en) {
+		for (retry = 0; retry < 3; retry++) {
+			val = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
+			val |= DP_MAINLINK_CTRL_FEC_ENABLE | DP_MAINLINK_CTRL_FEC_SEQ_EN |
+				DP_MAINLINK_CTRL_FEC_FLUSH_EN | DP_MAINLINK_FB_BOUNDARY_SEL;
+			msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, val);
+			usleep_range(900, 1000);
+			if (drm_dp_dpcd_readb(ctrl->aux, DP_FEC_STATUS, &status) == 1 &&
+				(status & DP_FEC_DECODE_EN_DETECTED))
+				break;
+		}
+		drm_dbg_dp(ctrl->drm_dev, "FEC status %#x after %d attempt(s)\n",
+			   status, min(retry + 1, 3));
+	}
+
+	drm_dp_dpcd_writeb(ctrl->aux, DP_DSC_ENABLE,
+			   panel->msm_dp_mode.dsc_en ? 1 : 0);
 }
 
 int msm_dp_ctrl_core_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
@@ -2609,7 +2650,7 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, struct msm_dp_panel *
 		pixel_rate_orig,
 		panel->msm_dp_mode.out_fmt_is_yuv_420);
 
-	msm_dp_panel_clear_dsc_dto(panel);
+	msm_dp_panel_dsc_hw_config(panel, msm_dp_ctrl->wide_bus_en);
 
 	msm_dp_ctrl_setup_tr_unit(ctrl, panel);
 
@@ -2622,6 +2663,8 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, struct msm_dp_panel *
 	mainlink_ready = msm_dp_ctrl_mainlink_ready(ctrl);
 	drm_dbg_dp(ctrl->drm_dev,
 		"mainlink %s\n", mainlink_ready ? "READY" : "NOT READY");
+	if (mainlink_ready)
+		msm_dp_ctrl_enable_fec_dsc(ctrl, panel);
 
 	return ret;
 }
