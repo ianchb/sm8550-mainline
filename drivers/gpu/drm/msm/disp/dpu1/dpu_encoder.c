@@ -656,6 +656,8 @@ struct drm_dsc_config *dpu_encoder_get_dsc_config(struct drm_encoder *drm_enc)
 
 	if (dpu_enc->disp_info.intf_type == INTF_DSI)
 		return msm_dsi_get_dsc_config(priv->kms->dsi[index]);
+	if (dpu_enc->disp_info.intf_type == INTF_DP)
+		return msm_dp_get_dsc_config(priv->kms->dp[index]);
 
 	return NULL;
 }
@@ -1229,9 +1231,17 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
 	num_dsc = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
 						drm_enc->crtc, DPU_HW_BLK_DSC,
 						hw_dsc, ARRAY_SIZE(hw_dsc));
-	for (i = 0; i < num_dsc; i++) {
-		dpu_enc->hw_dsc[i] = to_dpu_hw_dsc(hw_dsc[i]);
-		dsc_mask |= BIT(dpu_enc->hw_dsc[i]->idx - DSC_0);
+	for (i = 0; i < MAX_CHANNELS_PER_ENC; i++) {
+		/*
+		 * Clear stale entries: use_dsc_merge() counts non-NULL
+		 * hw_dsc pointers, and a leftover pair from a previous
+		 * DSC mode would wrongly disable merge_3d for the
+		 * following non-DSC mode (screen underflows, halves
+		 * duplicated).
+		 */
+		dpu_enc->hw_dsc[i] = i < num_dsc ? to_dpu_hw_dsc(hw_dsc[i]) : NULL;
+		if (i < num_dsc)
+			dsc_mask |= BIT(dpu_enc->hw_dsc[i]->idx - DSC_0);
 	}
 
 	dpu_enc->dsc_mask = dsc_mask;
@@ -2105,8 +2115,16 @@ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc)
 		}
 	}
 
-	if (dpu_enc->dsc)
+	if (dpu_enc->dsc) {
 		dpu_encoder_prep_dsc(dpu_enc, dpu_enc->dsc);
+
+		if (dpu_enc->disp_info.intf_type == INTF_DP) {
+			struct msm_drm_private *priv = drm_enc->dev->dev_private;
+
+			msm_dp_display_flush_pps(priv->kms->dp[
+					dpu_enc->disp_info.h_tile_instance[0]]);
+		}
+	}
 }
 
 /**

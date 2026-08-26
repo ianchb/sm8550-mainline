@@ -7,6 +7,7 @@
 #define _DP_PANEL_H_
 
 #include <drm/drm_modes.h>
+#include <drm/display/drm_dsc.h>
 #include <drm/msm_drm.h>
 
 #include "dp_aux.h"
@@ -21,6 +22,7 @@ struct msm_dp_display_mode {
 	u32 h_active_low;
 	u32 v_active_low;
 	bool out_fmt_is_yuv_420;
+	bool dsc_en;
 };
 
 struct msm_dp_panel_psr {
@@ -43,6 +45,23 @@ struct msm_dp_panel {
 	u32 hw_revision;
 
 	u32 max_bw_code;
+
+	/* DP 1.4 DSC/FEC capabilities and the active source configuration. */
+	u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE];
+	u8 fec_dpcd;
+	bool dsc_capable;
+	bool fec_capable;
+	struct drm_dsc_config dsc;
+
+	/*
+	 * Staged DSC state computed during atomic_check. It only becomes
+	 * active (msm_dp_mode.dsc / msm_dp_mode.dsc_en) at mode_set time via
+	 * msm_dp_panel_commit_dsc(), so check-only commits never clobber
+	 * the live panel configuration.
+	 */
+	struct drm_dsc_config dsc_staged;
+	u32 dsc_staged_bpp;
+	bool dsc_staged_valid;
 };
 
 int msm_dp_panel_init_panel_info(struct msm_dp_panel *msm_dp_panel);
@@ -60,6 +79,15 @@ void msm_dp_panel_handle_sink_request(struct msm_dp_panel *msm_dp_panel);
 void msm_dp_panel_tpg_config(struct msm_dp_panel *msm_dp_panel, bool enable);
 
 void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel);
+bool msm_dp_panel_dsc_possible(struct msm_dp_panel *msm_dp_panel,
+			       u32 mode_pclk_khz, u32 source_bpp);
+struct drm_dsc_config *msm_dp_panel_get_dsc_config(struct msm_dp_panel *msm_dp_panel);
+void msm_dp_panel_stage_dsc(struct msm_dp_panel *msm_dp_panel,
+		const struct drm_display_mode *mode, u32 mode_edid_bpp);
+void msm_dp_panel_commit_dsc(struct msm_dp_panel *msm_dp_panel);
+void msm_dp_panel_dsc_hw_config(struct msm_dp_panel *msm_dp_panel,
+				bool wide_bus_en);
+void msm_dp_panel_flush_pps(struct msm_dp_panel *msm_dp_panel);
 
 void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel, struct dp_sdp *vsc_sdp);
 void msm_dp_panel_disable_vsc_sdp(struct msm_dp_panel *msm_dp_panel);

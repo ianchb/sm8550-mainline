@@ -83,6 +83,11 @@ static int msm_dp_bridge_atomic_check(struct drm_bridge *drm_bridge,
 			return -EINVAL;
 	}
 
+	/* DPU resource allocation runs before the legacy bridge mode_set callback. */
+	if (conn_state->crtc && crtc_state)
+		msm_dp_prepare_dsc_config(dp, &crtc_state->adjusted_mode,
+					conn_state->connector->display_info.bpc * 3);
+
 	old_conn_state =
 		drm_atomic_get_old_connector_state(conn_state->state,
 						   conn_state->connector);
