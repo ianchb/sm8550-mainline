@@ -758,6 +758,7 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 	int mode_pclk_khz = mode->clock;
 	int link_pclk_khz;
 	bool is_yuv_420;
+	int mode_pclk_orig = mode->clock;
 
 	if (!dp || !mode_pclk_khz || !dp->connector) {
 		DRM_ERROR("invalid params\n");
@@ -788,8 +789,12 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 	if (!mode_bpp)
 		mode_bpp = default_bpp;
 
-	mode_bpp = msm_dp_panel_get_mode_bpp(msm_dp_display->panel,
-			mode_bpp, link_pclk_khz);
+	if (msm_dp_panel_dsc_possible(msm_dp_display->panel, mode_pclk_orig,
+					mode_bpp))
+		mode_bpp = 8;
+	else
+		mode_bpp = msm_dp_panel_get_mode_bpp(msm_dp_display->panel,
+					mode_bpp, link_pclk_khz);
 
 	mode_rate_khz = link_pclk_khz * mode_bpp;
 	supported_rate_khz = link_info->num_lanes * link_info->rate * 8;
@@ -798,6 +803,47 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 		return MODE_BAD;
 
 	return MODE_OK;
+}
+
+struct drm_dsc_config *msm_dp_get_dsc_config(struct msm_dp *dp)
+{
+	struct msm_dp_display_private *display;
+
+	if (!dp)
+		return NULL;
+
+	display = container_of(dp, struct msm_dp_display_private,
+				msm_dp_display);
+	return msm_dp_panel_get_dsc_config(display->panel);
+}
+
+void msm_dp_prepare_dsc_config(struct msm_dp *dp,
+			       const struct drm_display_mode *mode, u32 bpp)
+{
+	struct msm_dp_display_private *display;
+
+	if (!dp || !mode)
+		return;
+
+	display = container_of(dp, struct msm_dp_display_private,
+				msm_dp_display);
+	/*
+	 * Staging only: the config becomes active at mode_set time. This
+	 * keeps check-only commits from clobbering the live panel mode.
+	 */
+	msm_dp_panel_stage_dsc(display->panel, mode, bpp ?: 24);
+}
+
+void msm_dp_display_flush_pps(struct msm_dp *dp)
+{
+	struct msm_dp_display_private *display;
+
+	if (!dp)
+		return;
+
+	display = container_of(dp, struct msm_dp_display_private,
+				msm_dp_display);
+	msm_dp_panel_flush_pps(display->panel);
 }
 
 int msm_dp_display_get_modes(struct msm_dp *dp)
@@ -1355,7 +1401,8 @@ bool msm_dp_display_vsc_sdp_supported(const struct msm_dp *msm_dp_display)
 bool msm_dp_needs_periph_flush(const struct msm_dp *msm_dp_display,
 			       const struct drm_display_mode *mode)
 {
-	return msm_dp_display_vsc_sdp_supported(msm_dp_display);
+	return msm_dp_display_vsc_sdp_supported(msm_dp_display) ||
+		!!msm_dp_get_dsc_config((struct msm_dp *)msm_dp_display);
 }
 
 bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
