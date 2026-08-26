@@ -1263,6 +1263,13 @@
 	status = "okay";
 };
 
+/* Keep the DPU performance ceiling high enough for the 300 Hz DP test mode. */
+&mdss_mdp {
+	assigned-clocks = <&dispcc DISP_CC_MDSS_VSYNC_CLK>,
+			  <&dispcc DISP_CC_MDSS_MDP_CLK>;
+	assigned-clock-rates = <19200000>, <700000000>;
+};
+
 &mdss_dsi0 {
 	vdda-supply = <&vreg_l3e_1p2>;
 	qcom,dual-dsi-mode;
