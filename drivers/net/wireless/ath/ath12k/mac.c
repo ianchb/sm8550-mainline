@@ -7,6 +7,7 @@
 #include <net/mac80211.h>
 #include <net/cfg80211.h>
 #include <linux/etherdevice.h>
+#include <linux/hex.h>
 
 #include "mac.h"
 #include "core.h"
@@ -53,6 +54,8 @@
 
 #define ATH12K_5_9_GHZ_MIN_FREQ 5845
 #define ATH12K_5_9_GHZ_MAX_FREQ 5885
+#define ATH12K_WLAN_MAC_FILE "wlan_mac.bin"
+#define ATH12K_WLAN_MAC_PREFIX "wlan0="
 
 static const struct ieee80211_channel ath12k_2ghz_channels[] = {
 	CHAN2G(1, 2412, 0),
@@ -14766,6 +14769,47 @@ static int ath12k_mac_setup_register(struct ath12k *ar,
 	return 0;
 }
 
+static bool ath12k_mac_read_wlan_mac(struct ath12k_base *ab, u8 *addr)
+{
+	const struct firmware *fw;
+	const size_t prefix_len = strlen(ATH12K_WLAN_MAC_PREFIX);
+	size_t data_len;
+	int ret;
+
+	if (ab->hw_rev != ATH12K_HW_WCN7850_HW20)
+		return false;
+
+	fw = ath12k_core_firmware_request(ab, ATH12K_WLAN_MAC_FILE);
+	if (IS_ERR(fw))
+		return false;
+
+	data_len = fw->size;
+	while (data_len && (fw->data[data_len - 1] == '\n' ||
+			    fw->data[data_len - 1] == '\r'))
+		data_len--;
+
+	if (data_len != prefix_len + 2 * ETH_ALEN ||
+	    memcmp(fw->data, ATH12K_WLAN_MAC_PREFIX, prefix_len)) {
+		ath12k_warn(ab, "invalid %s format\n", ATH12K_WLAN_MAC_FILE);
+		goto out;
+	}
+
+	ret = hex2bin(addr, fw->data + prefix_len, ETH_ALEN);
+	if (ret || !is_valid_ether_addr(addr)) {
+		ath12k_warn(ab, "invalid MAC address in %s\n",
+			    ATH12K_WLAN_MAC_FILE);
+		goto out;
+	}
+
+	ath12k_info(ab, "using MAC address from %s\n", ATH12K_WLAN_MAC_FILE);
+	release_firmware(fw);
+	return true;
+
+out:
+	release_firmware(fw);
+	return false;
+}
+
 static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 {
 	struct ieee80211_hw *hw = ah->hw;
@@ -14805,8 +14849,10 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 		}
 
 		if (!is_valid_ether_addr(ar->mac_addr)) {
-			ath12k_warn(ab, "invalid MAC address; choosing random\n");
-			eth_random_addr(ar->mac_addr);
+			if (!ath12k_mac_read_wlan_mac(ab, ar->mac_addr)) {
+				ath12k_warn(ab, "invalid MAC address; choosing random\n");
+				eth_random_addr(ar->mac_addr);
+			}
 		}
 
 		ret = ath12k_mac_setup_register(ar, &ht_cap_info, hw->wiphy->bands);
