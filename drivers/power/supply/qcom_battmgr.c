@@ -10,12 +10,15 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/pm.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/soc/qcom/qcom_battmgr.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
+#include <linux/spinlock.h>
 #include <linux/math.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -23,6 +26,7 @@
 
 #define BATTMGR_CHEMISTRY_LEN	4
 #define BATTMGR_STRING_LEN	128
+#define BATTMGR_NO_PROPERTY	(-1)
 
 enum qcom_battmgr_variant {
 	QCOM_BATTMGR_SC8280XP,
@@ -163,7 +167,19 @@ enum qcom_battmgr_variant {
 #define XM_BATT_SLAVE_AUTHENTIC		0xa5
 #define XM_BATT_FG2_RM				0xa6
 #define XM_BATT_FG2_FCC			0xa7
+#define XM_BATT_CHARGING_SUSPEND_BATTERY		0xdb
 #define XM_BATT_PPS_PTF			0xe7
+
+/* Watch for threshold crossings while the host is awake. */
+#define XIAOMI_CHARGE_CTRL_POLL			(10 * HZ)
+#define XIAOMI_CHARGE_CTRL_POLL_DISCHARGING	(120 * HZ)
+#define XIAOMI_CHARGE_CTRL_NOTIFY_DELAY		HZ
+
+enum qcom_battmgr_charge_inhibit {
+	QCOM_BATTMGR_INHIBIT_RELEASED,
+	QCOM_BATTMGR_INHIBIT_UNKNOWN,
+	QCOM_BATTMGR_INHIBIT_ACTIVE,
+};
 
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
@@ -395,10 +411,18 @@ struct qcom_battmgr {
 
 	enum qcom_battmgr_unit unit;
 
+	/* The receive callback and PDR run outside the request mutex. */
+	spinlock_t response_lock;
 	int error;
 	struct completion ack;
+	u32 request_opcode;
+	int request_property;
+	bool request_pending;
+	bool stale_inhibit_read;
+	unsigned int service_generation;
 
 	bool service_up;
+	bool stopping;
 
 	struct qcom_battmgr_info info;
 	struct qcom_battmgr_status status;
@@ -406,12 +430,22 @@ struct qcom_battmgr {
 	struct qcom_battmgr_usb usb;
 	struct qcom_battmgr_wireless wireless;
 
-	bool xiaomi_prop_pending;
-	unsigned int xiaomi_prop;
 	u32 xiaomi_prop_value;
 	u8 xiaomi_prop_data[32];
 	size_t xiaomi_prop_data_len;
 	u8 xiaomi_verify_slave;
+
+	bool xiaomi_charge_ctrl;
+	bool charge_ctrl_hold;
+	bool charge_ctrl_stopping;
+	enum qcom_battmgr_charge_inhibit charge_inhibit;
+	unsigned int charge_inhibit_generation;
+	unsigned int charge_ctrl_start;
+	unsigned int charge_ctrl_end;
+	unsigned long charge_ctrl_next_notification;
+	struct delayed_work charge_ctrl_work;
+	/* Serializes software thresholds and charger inhibit state. */
+	struct mutex charge_ctrl_lock;
 
 	struct work_struct enable_work;
 
@@ -425,24 +459,55 @@ struct qcom_battmgr {
 static struct qcom_battmgr *xiaomi_battmgr;
 static DEFINE_MUTEX(xiaomi_battmgr_lock);
 
-static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
+static bool qcom_battmgr_is_inhibit_read(unsigned int opcode, int property)
 {
+	return opcode == BATTMGR_XM_PROPERTY_GET && property == XM_BATT_CHARGING_SUSPEND_BATTERY;
+}
+
+static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len, int property)
+{
+	const struct pmic_glink_hdr *hdr = data;
+	unsigned int opcode = le32_to_cpu(hdr->opcode);
+	bool inhibit_read = qcom_battmgr_is_inhibit_read(opcode, property);
 	unsigned long left;
 	int ret;
 
-	reinit_completion(&battmgr->ack);
+	lockdep_assert_held(&battmgr->lock);
+	if (battmgr->stopping)
+		return -ENODEV;
 
-	battmgr->error = 0;
+	scoped_guard(spinlock_irqsave, &battmgr->response_lock) {
+		if (!battmgr->service_up)
+			return -EAGAIN;
+		/*
+		 * The wire format has no transaction ID. Until the overdue
+		 * read drains, a subsequent read cannot verify a write.
+		 */
+		if (inhibit_read && battmgr->stale_inhibit_read)
+			return -EAGAIN;
+
+		reinit_completion(&battmgr->ack);
+		battmgr->error = 0;
+		battmgr->request_opcode = opcode;
+		battmgr->request_property = property;
+		battmgr->request_pending = true;
+	}
 
 	ret = pmic_glink_send(battmgr->client, data, len);
-	if (ret < 0)
-		return ret;
+	left = ret ? 0 : wait_for_completion_timeout(&battmgr->ack, HZ);
 
-	left = wait_for_completion_timeout(&battmgr->ack, HZ);
-	if (!left)
-		return -ETIMEDOUT;
+	guard(spinlock_irqsave)(&battmgr->response_lock);
+	if (ret && inhibit_read && battmgr->error == -ECONNRESET)
+		battmgr->stale_inhibit_read = false;
 
-	return battmgr->error;
+	if (battmgr->request_pending) {
+		battmgr->request_pending = false;
+		if (!ret && !left && inhibit_read)
+			battmgr->stale_inhibit_read = true;
+		return ret ?: -ETIMEDOUT;
+	}
+
+	return battmgr->error > 0 ? -EIO : battmgr->error;
 }
 
 static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
@@ -457,7 +522,7 @@ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcod
 		.value = cpu_to_le32(value),
 	};
 
-	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+	return qcom_battmgr_request(battmgr, &request, sizeof(request), property);
 }
 
 static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, int opcode,
@@ -468,12 +533,7 @@ static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, in
 	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
 		return -EOPNOTSUPP;
 
-	if (!battmgr->service_up)
-		return -EAGAIN;
-
 	mutex_lock(&battmgr->lock);
-	battmgr->xiaomi_prop_pending = true;
-	battmgr->xiaomi_prop = property;
 	battmgr->xiaomi_prop_value = 0;
 	battmgr->xiaomi_prop_data_len = 0;
 
@@ -481,7 +541,6 @@ static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, in
 	if (!ret && out_value)
 		*out_value = battmgr->xiaomi_prop_value;
 
-	battmgr->xiaomi_prop_pending = false;
 	mutex_unlock(&battmgr->lock);
 
 	return ret;
@@ -517,7 +576,8 @@ static void qcom_battmgr_clear_xiaomi_instance(void *data)
 	mutex_unlock(&xiaomi_battmgr_lock);
 }
 
-static int qcom_battmgr_xiaomi_update_capacity(struct qcom_battmgr *battmgr)
+static int qcom_battmgr_xiaomi_get_fg_capacity(struct qcom_battmgr *battmgr,
+					      unsigned int *capacity)
 {
 	u32 fg1_rm, fg1_fcc, fg2_rm, fg2_fcc;
 	u64 rm, fcc;
@@ -548,11 +608,26 @@ static int qcom_battmgr_xiaomi_update_capacity(struct qcom_battmgr *battmgr)
 	if (!fcc)
 		return -ENODATA;
 
-	battmgr->status.percent = min_t(unsigned int,
-					DIV_ROUND_CLOSEST_ULL(rm * 100, fcc),
-					100);
+	*capacity = min_t(u64, DIV_ROUND_CLOSEST_ULL(rm * 100, fcc), 100);
 
 	return 0;
+}
+
+static int qcom_battmgr_xiaomi_get_capacity(struct qcom_battmgr *battmgr, unsigned int *capacity)
+{
+	int ret;
+
+	ret = qcom_battmgr_xiaomi_get_fg_capacity(battmgr, capacity);
+	if (!ret)
+		return 0;
+
+	guard(mutex)(&battmgr->lock);
+	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, 0);
+	if (ret)
+		return ret;
+
+	*capacity = battmgr->status.percent;
+	return *capacity <= 100 ? 0 : -ENODATA;
 }
 
 static int qcom_battmgr_xiaomi_request_vdm(struct qcom_battmgr *battmgr, int opcode,
@@ -570,19 +645,14 @@ static int qcom_battmgr_xiaomi_request_vdm(struct qcom_battmgr *battmgr, int opc
 	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
 		return -EOPNOTSUPP;
 
-	if (!battmgr->service_up)
-		return -EAGAIN;
-
 	if (data)
 		memcpy(request.data, data, sizeof(request.data));
 
 	mutex_lock(&battmgr->lock);
-	battmgr->xiaomi_prop_pending = true;
-	battmgr->xiaomi_prop = property;
 	battmgr->xiaomi_prop_value = 0;
 	battmgr->xiaomi_prop_data_len = 0;
 
-	ret = qcom_battmgr_request(battmgr, &request, sizeof(request));
+	ret = qcom_battmgr_request(battmgr, &request, sizeof(request), property);
 	if (!ret && out_data) {
 		if (battmgr->xiaomi_prop_data_len < sizeof(request.data)) {
 			ret = -ENODATA;
@@ -591,7 +661,6 @@ static int qcom_battmgr_xiaomi_request_vdm(struct qcom_battmgr *battmgr, int opc
 		}
 	}
 
-	battmgr->xiaomi_prop_pending = false;
 	mutex_unlock(&battmgr->lock);
 
 	return ret;
@@ -613,19 +682,14 @@ static int qcom_battmgr_xiaomi_request_digest(struct qcom_battmgr *battmgr, int 
 	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
 		return -EOPNOTSUPP;
 
-	if (!battmgr->service_up)
-		return -EAGAIN;
-
 	if (digest)
 		memcpy(request.digest, digest, sizeof(request.digest));
 
 	mutex_lock(&battmgr->lock);
-	battmgr->xiaomi_prop_pending = true;
-	battmgr->xiaomi_prop = XM_BATT_VERIFY_DIGEST;
 	battmgr->xiaomi_prop_value = 0;
 	battmgr->xiaomi_prop_data_len = 0;
 
-	ret = qcom_battmgr_request(battmgr, &request, sizeof(request));
+	ret = qcom_battmgr_request(battmgr, &request, sizeof(request), XM_BATT_VERIFY_DIGEST);
 	if (!ret && out_digest) {
 		if (battmgr->xiaomi_prop_data_len < sizeof(request.digest)) {
 			ret = -ENODATA;
@@ -635,7 +699,6 @@ static int qcom_battmgr_xiaomi_request_digest(struct qcom_battmgr *battmgr, int 
 		}
 	}
 
-	battmgr->xiaomi_prop_pending = false;
 	mutex_unlock(&battmgr->lock);
 
 	return ret;
@@ -650,7 +713,7 @@ static int qcom_battmgr_update_status(struct qcom_battmgr *battmgr)
 		.battery_id = cpu_to_le32(0),
 	};
 
-	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+	return qcom_battmgr_request(battmgr, &request, sizeof(request), BATTMGR_NO_PROPERTY);
 }
 
 static int qcom_battmgr_update_info(struct qcom_battmgr *battmgr)
@@ -662,7 +725,7 @@ static int qcom_battmgr_update_info(struct qcom_battmgr *battmgr)
 		.battery_id = cpu_to_le32(0),
 	};
 
-	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+	return qcom_battmgr_request(battmgr, &request, sizeof(request), BATTMGR_NO_PROPERTY);
 }
 
 static int qcom_battmgr_update_charge_time(struct qcom_battmgr *battmgr)
@@ -675,7 +738,7 @@ static int qcom_battmgr_update_charge_time(struct qcom_battmgr *battmgr)
 		.percent = cpu_to_le32(100),
 	};
 
-	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+	return qcom_battmgr_request(battmgr, &request, sizeof(request), BATTMGR_NO_PROPERTY);
 }
 
 static int qcom_battmgr_update_discharge_time(struct qcom_battmgr *battmgr)
@@ -688,7 +751,7 @@ static int qcom_battmgr_update_discharge_time(struct qcom_battmgr *battmgr)
 		.rate = cpu_to_le32(0),
 	};
 
-	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+	return qcom_battmgr_request(battmgr, &request, sizeof(request), BATTMGR_NO_PROPERTY);
 }
 
 static const u8 sm8350_bat_prop_map[] = {
@@ -727,13 +790,6 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
 		return -EINVAL;
 
 	prop = sm8350_bat_prop_map[psp];
-
-	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
-	    psp == POWER_SUPPLY_PROP_CAPACITY) {
-		ret = qcom_battmgr_xiaomi_update_capacity(battmgr);
-		if (!ret)
-			return 0;
-	}
 
 	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
@@ -787,10 +843,28 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 	enum qcom_battmgr_unit unit = battmgr->unit;
+	unsigned int capacity;
 	int ret;
 
-	if (!battmgr->service_up)
+	if (battmgr->xiaomi_charge_ctrl &&
+	    (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	     psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)) {
+		guard(mutex)(&battmgr->charge_ctrl_lock);
+		val->intval = psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ?
+			      battmgr->charge_ctrl_start : battmgr->charge_ctrl_end;
+		return 0;
+	}
+
+	if (!READ_ONCE(battmgr->service_up))
 		return -EAGAIN;
+
+	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 && psp == POWER_SUPPLY_PROP_CAPACITY) {
+		ret = qcom_battmgr_xiaomi_get_capacity(battmgr, &capacity);
+		if (ret)
+			return ret;
+		val->intval = capacity;
+		return 0;
+	}
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 	    battmgr->variant == QCOM_BATTMGR_X1E80100)
@@ -803,6 +877,11 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
+		if (val->intval == POWER_SUPPLY_STATUS_CHARGING &&
+		    READ_ONCE(battmgr->charge_inhibit) == QCOM_BATTMGR_INHIBIT_ACTIVE &&
+		    READ_ONCE(battmgr->charge_inhibit_generation) ==
+		    READ_ONCE(battmgr->service_generation))
+			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = battmgr->info.charge_type;
@@ -945,7 +1024,7 @@ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
 		.delta_soc = cpu_to_le32(delta_soc),
 	};
 
-	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+	return qcom_battmgr_request(battmgr, &request, sizeof(request), BATTMGR_NO_PROPERTY);
 }
 
 static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr, int start_soc)
@@ -953,6 +1032,7 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
 	u32 target_soc, delta_soc;
 	int ret;
 
+	guard(mutex)(&battmgr->lock);
 	start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
 
 	/*
@@ -966,19 +1046,17 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
 		delta_soc = target_soc - start_soc;
 		delta_soc = min_t(u32, delta_soc, CHARGE_CTRL_DELTA_SOC);
 	} else {
-		target_soc =  battmgr->info.charge_ctrl_end;
+		target_soc = battmgr->info.charge_ctrl_end;
 		delta_soc = battmgr->info.charge_ctrl_end - start_soc;
 	}
 
-	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
-	mutex_unlock(&battmgr->lock);
 	if (!ret) {
 		battmgr->info.charge_ctrl_start = start_soc;
 		battmgr->info.charge_ctrl_end = target_soc;
 	}
 
-	return 0;
+	return ret;
 }
 
 static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
@@ -986,20 +1064,244 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
 	u32 delta_soc = CHARGE_CTRL_DELTA_SOC;
 	int ret;
 
+	guard(mutex)(&battmgr->lock);
 	end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
 
 	if (battmgr->info.charge_ctrl_start && end_soc > battmgr->info.charge_ctrl_start)
 		delta_soc = end_soc - battmgr->info.charge_ctrl_start;
 
-	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
-	mutex_unlock(&battmgr->lock);
 	if (!ret) {
 		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
 		battmgr->info.charge_ctrl_end = end_soc;
 	}
 
+	return ret;
+}
+
+static bool qcom_battmgr_xiaomi_inhibit_needs_release(struct qcom_battmgr *battmgr)
+{
+	return READ_ONCE(battmgr->charge_inhibit) != QCOM_BATTMGR_INHIBIT_RELEASED ||
+	       READ_ONCE(battmgr->charge_inhibit_generation) !=
+	       READ_ONCE(battmgr->service_generation);
+}
+
+static int qcom_battmgr_xiaomi_set_charge_inhibit(struct qcom_battmgr *battmgr, bool inhibit)
+{
+	unsigned int generation = READ_ONCE(battmgr->service_generation);
+	u32 value;
+	int ret, release_ret;
+
+	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+						   XM_BATT_CHARGING_SUSPEND_BATTERY, 0, &value);
+	if (!ret && value > 1)
+		ret = -EPROTO;
+	if (ret) {
+		if (!inhibit && qcom_battmgr_xiaomi_inhibit_needs_release(battmgr))
+			goto release_unverified;
+		return ret;
+	}
+
+	if (value != inhibit) {
+		/* The write can take effect before its reply arrives. */
+		WRITE_ONCE(battmgr->charge_inhibit, QCOM_BATTMGR_INHIBIT_UNKNOWN);
+		ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_SET,
+							   XM_BATT_CHARGING_SUSPEND_BATTERY,
+							   inhibit, NULL);
+		if (ret)
+			goto release_unverified;
+
+		ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_GET,
+							   XM_BATT_CHARGING_SUSPEND_BATTERY,
+							   0, &value);
+		if (ret)
+			goto release_unverified;
+		if (value != inhibit) {
+			ret = -EIO;
+			goto release_unverified;
+		}
+	}
+
+	if (generation != READ_ONCE(battmgr->service_generation)) {
+		ret = -EAGAIN;
+		goto release_unverified;
+	}
+
+	WRITE_ONCE(battmgr->charge_inhibit_generation, generation);
+	WRITE_ONCE(battmgr->charge_inhibit, inhibit ? QCOM_BATTMGR_INHIBIT_ACTIVE :
+						    QCOM_BATTMGR_INHIBIT_RELEASED);
 	return 0;
+
+release_unverified:
+	/* The firmware may have stopped the charger before the reply was lost. */
+	WRITE_ONCE(battmgr->charge_inhibit, QCOM_BATTMGR_INHIBIT_UNKNOWN);
+	release_ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_SET,
+							   XM_BATT_CHARGING_SUSPEND_BATTERY,
+							   0, NULL);
+	if (release_ret && release_ret != -EAGAIN)
+		dev_warn_ratelimited(battmgr->dev, "failed to release unverified charge inhibit: %d\n",
+				     release_ret);
+	return ret;
+}
+
+static int qcom_battmgr_xiaomi_charge_source_online(struct qcom_battmgr *battmgr, bool *online)
+{
+	int ret;
+
+	guard(mutex)(&battmgr->lock);
+	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_STATUS, 0);
+	if (ret)
+		return ret;
+
+	if (battmgr->status.status != POWER_SUPPLY_STATUS_DISCHARGING) {
+		*online = true;
+		return 0;
+	}
+
+	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
+	if (!ret)
+		*online = battmgr->usb.online;
+
+	return ret;
+}
+
+static int qcom_battmgr_xiaomi_apply_charge_thresholds(struct qcom_battmgr *battmgr,
+						       unsigned int start, unsigned int end,
+						       bool *hold, unsigned long *delay)
+{
+	unsigned int capacity;
+	bool online;
+	int ret;
+
+	if (end == CHARGE_CTRL_END_THR_MAX) {
+		*hold = false;
+		if (qcom_battmgr_xiaomi_inhibit_needs_release(battmgr))
+			return qcom_battmgr_xiaomi_set_charge_inhibit(battmgr, false);
+		return 0;
+	}
+
+	ret = qcom_battmgr_xiaomi_charge_source_online(battmgr, &online);
+	if (ret)
+		return ret;
+
+	if (!online)
+		*delay = XIAOMI_CHARGE_CTRL_POLL_DISCHARGING;
+
+	if (online || *hold) {
+		ret = qcom_battmgr_xiaomi_get_capacity(battmgr, &capacity);
+		if (ret)
+			return ret;
+
+		*hold = (online && capacity >= end) || (*hold && capacity > start);
+	}
+
+	if (online || (!*hold && qcom_battmgr_xiaomi_inhibit_needs_release(battmgr)))
+		return qcom_battmgr_xiaomi_set_charge_inhibit(battmgr, *hold);
+
+	return 0;
+}
+
+static bool qcom_battmgr_xiaomi_charge_ctrl_needed(struct qcom_battmgr *battmgr)
+{
+	return READ_ONCE(battmgr->charge_ctrl_end) < CHARGE_CTRL_END_THR_MAX ||
+	       qcom_battmgr_xiaomi_inhibit_needs_release(battmgr);
+}
+
+static void qcom_battmgr_xiaomi_schedule_charge_ctrl(struct qcom_battmgr *battmgr)
+{
+	if (battmgr->xiaomi_charge_ctrl && qcom_battmgr_xiaomi_charge_ctrl_needed(battmgr))
+		mod_delayed_work(system_freezable_wq, &battmgr->charge_ctrl_work, 0);
+}
+
+static int qcom_battmgr_xiaomi_set_charge_threshold(struct qcom_battmgr *battmgr,
+						    enum power_supply_property psp, int threshold)
+{
+	unsigned long delay = XIAOMI_CHARGE_CTRL_POLL;
+	unsigned int start, end;
+	bool hold;
+	int ret;
+
+	guard(mutex)(&battmgr->charge_ctrl_lock);
+	if (battmgr->charge_ctrl_stopping)
+		return -ENODEV;
+
+	start = battmgr->charge_ctrl_start;
+	end = battmgr->charge_ctrl_end;
+
+	if (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD) {
+		start = clamp(threshold, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
+		if (start >= end)
+			return -EINVAL;
+	} else {
+		end = clamp(threshold, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
+		/* An end-only write must work with the default start threshold. */
+		if (end <= start)
+			start = end - CHARGE_CTRL_DELTA_SOC;
+	}
+
+	hold = battmgr->charge_ctrl_hold && end <= battmgr->charge_ctrl_end;
+	ret = qcom_battmgr_xiaomi_apply_charge_thresholds(battmgr, start, end, &hold, &delay);
+	if (ret) {
+		qcom_battmgr_xiaomi_schedule_charge_ctrl(battmgr);
+		return ret;
+	}
+
+	battmgr->charge_ctrl_hold = hold;
+	battmgr->charge_ctrl_start = start;
+	WRITE_ONCE(battmgr->charge_ctrl_end, end);
+	if (qcom_battmgr_xiaomi_charge_ctrl_needed(battmgr))
+		mod_delayed_work(system_freezable_wq, &battmgr->charge_ctrl_work, delay);
+	else
+		cancel_delayed_work(&battmgr->charge_ctrl_work);
+	power_supply_changed(battmgr->bat_psy);
+
+	return 0;
+}
+
+static void qcom_battmgr_xiaomi_charge_ctrl_work(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
+						  struct qcom_battmgr, charge_ctrl_work);
+	unsigned long delay = XIAOMI_CHARGE_CTRL_POLL;
+	enum qcom_battmgr_charge_inhibit previous;
+	bool hold;
+	int ret;
+
+	guard(mutex)(&battmgr->charge_ctrl_lock);
+	if (!READ_ONCE(battmgr->service_up) || !qcom_battmgr_xiaomi_charge_ctrl_needed(battmgr))
+		return;
+
+	previous = battmgr->charge_inhibit;
+	hold = battmgr->charge_ctrl_hold;
+	ret = qcom_battmgr_xiaomi_apply_charge_thresholds(battmgr,
+							  battmgr->charge_ctrl_start,
+							  battmgr->charge_ctrl_end,
+							  &hold, &delay);
+	if (!ret)
+		battmgr->charge_ctrl_hold = hold;
+	else if (ret != -EAGAIN)
+		dev_warn_ratelimited(battmgr->dev, "failed to reconcile battery charge inhibit: %d\n",
+				     ret);
+	if (previous != battmgr->charge_inhibit)
+		power_supply_changed(battmgr->bat_psy);
+
+	if (qcom_battmgr_xiaomi_charge_ctrl_needed(battmgr))
+		queue_delayed_work(system_freezable_wq, &battmgr->charge_ctrl_work, delay);
+}
+
+static void qcom_battmgr_xiaomi_cleanup_charge_ctrl(struct qcom_battmgr *battmgr)
+{
+	int ret;
+
+	disable_delayed_work_sync(&battmgr->charge_ctrl_work);
+	guard(mutex)(&battmgr->charge_ctrl_lock);
+	battmgr->charge_ctrl_stopping = true;
+	if (!qcom_battmgr_xiaomi_inhibit_needs_release(battmgr))
+		return;
+
+	ret = qcom_battmgr_xiaomi_set_charge_inhibit(battmgr, false);
+	if (ret)
+		dev_warn(battmgr->dev, "could not verify release of charge inhibit: %d\n", ret);
 }
 
 static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
@@ -1056,8 +1358,12 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		if (battmgr->xiaomi_charge_ctrl)
+			return qcom_battmgr_xiaomi_set_charge_threshold(battmgr, psp, pval->intval);
 		return qcom_battmgr_set_charge_start_threshold(battmgr, pval->intval);
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		if (battmgr->xiaomi_charge_ctrl)
+			return qcom_battmgr_xiaomi_set_charge_threshold(battmgr, psp, pval->intval);
 		return qcom_battmgr_set_charge_end_threshold(battmgr, pval->intval);
 	default:
 		return -EINVAL;
@@ -1920,11 +2226,17 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		break;
 	case NOTIF_WLS_PROPERTY:
 		power_supply_changed(battmgr->wls_psy);
-		break;
+		return;
 	default:
 		if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
 			dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
-		break;
+		return;
+	}
+
+	if (battmgr->xiaomi_charge_ctrl && qcom_battmgr_xiaomi_charge_ctrl_needed(battmgr) &&
+	    time_after_eq(jiffies, battmgr->charge_ctrl_next_notification)) {
+		battmgr->charge_ctrl_next_notification = jiffies + XIAOMI_CHARGE_CTRL_NOTIFY_DELAY;
+		mod_delayed_work(system_freezable_wq, &battmgr->charge_ctrl_work, 0);
 	}
 }
 
@@ -1989,6 +2301,7 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
 	if (payload_len < sizeof(__le32)) {
 		dev_warn(battmgr->dev, "invalid payload length for %#x: %zd\n",
 			 opcode, len);
+		battmgr->error = -ENODATA;
 		return;
 	}
 
@@ -2091,8 +2404,6 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
 		dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
 		break;
 	}
-
-	complete(&battmgr->ack);
 }
 
 static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
@@ -2107,6 +2418,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 	if (payload_len < sizeof(__le32)) {
 		dev_warn(battmgr->dev, "invalid payload length for %#x: %zd\n",
 			 opcode, len);
+		battmgr->error = -ENODATA;
 		return;
 	}
 
@@ -2119,11 +2431,6 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			break;
 		}
 
-		if (!battmgr->xiaomi_prop_pending || property != battmgr->xiaomi_prop) {
-			dev_dbg(battmgr->dev, "unsolicited Xiaomi property %#x response\n", property);
-			return;
-		}
-
 		if (payload_len == sizeof(resp->intval)) {
 			battmgr->error = le32_to_cpu(resp->intval.result);
 			if (!battmgr->error)
@@ -2131,7 +2438,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			break;
 		}
 
-		if (payload_len > sizeof(resp->intval.property)) {
+		if (payload_len >= sizeof(resp->intval.property) + sizeof(resp->intval.value)) {
 			size_t data_len = min_t(size_t,
 						payload_len - sizeof(resp->intval.property),
 						sizeof(battmgr->xiaomi_prop_data));
@@ -2190,7 +2497,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 
 			battmgr->error = le32_to_cpu(resp->intval.result);
 			if (battmgr->error)
-				goto out_complete;
+				return;
 		}
 
 		switch (property) {
@@ -2285,7 +2592,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 
 		battmgr->error = le32_to_cpu(resp->intval.result);
 		if (battmgr->error)
-			goto out_complete;
+			return;
 
 		switch (property) {
 		case USB_ONLINE:
@@ -2326,7 +2633,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 
 		battmgr->error = le32_to_cpu(resp->intval.result);
 		if (battmgr->error)
-			goto out_complete;
+			return;
 
 		switch (property) {
 		case WLS_ONLINE:
@@ -2358,24 +2665,60 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
 		break;
 	}
-
-out_complete:
-	complete(&battmgr->ack);
 }
 
 static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 {
-	const struct pmic_glink_hdr *hdr = data;
+	const struct qcom_battmgr_message *resp = data;
 	struct qcom_battmgr *battmgr = priv;
-	unsigned int opcode = le32_to_cpu(hdr->opcode);
+	unsigned int opcode = le32_to_cpu(resp->hdr.opcode);
+	int property = BATTMGR_NO_PROPERTY;
+	bool xiaomi_property, inhibit_property;
 
-	if (opcode == BATTMGR_NOTIFICATION)
+	if (opcode == BATTMGR_NOTIFICATION) {
 		qcom_battmgr_notification(battmgr, data, len);
-	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
-		 battmgr->variant == QCOM_BATTMGR_X1E80100)
+		return;
+	}
+
+	xiaomi_property = opcode == BATTMGR_XM_PROPERTY_GET || opcode == BATTMGR_XM_PROPERTY_SET;
+	if (len >= sizeof(resp->hdr) + sizeof(resp->intval.property))
+		property = le32_to_cpu(resp->intval.property);
+	inhibit_property = xiaomi_property && property == XM_BATT_CHARGING_SUSPEND_BATTERY;
+	if (inhibit_property &&
+	    (le32_to_cpu(resp->hdr.type) != PMIC_GLINK_REQ_RESP ||
+	     len != sizeof(resp->hdr) + sizeof(resp->intval)))
+		return;
+
+	guard(spinlock_irqsave)(&battmgr->response_lock);
+	if (battmgr->stale_inhibit_read && qcom_battmgr_is_inhibit_read(opcode, property)) {
+		battmgr->stale_inhibit_read = false;
+		qcom_battmgr_xiaomi_schedule_charge_ctrl(battmgr);
+		return;
+	}
+
+	if (!battmgr->request_pending || opcode != battmgr->request_opcode)
+		return;
+
+	/*
+	 * Xiaomi's regular battery properties do not all echo the request
+	 * index. Its vendor properties and USB/WLS properties do.
+	 */
+	if ((xiaomi_property || opcode == BATTMGR_USB_PROPERTY_GET ||
+	     opcode == BATTMGR_WLS_PROPERTY_GET ||
+	     (opcode == BATTMGR_BAT_PROPERTY_GET &&
+	      (battmgr->variant != XIAOMI_BATTMGR_SM8550 ||
+	       battmgr->request_property <= BATT_CHG_CTRL_LIM_MAX))) &&
+	    property != battmgr->request_property)
+		return;
+
+	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+	    battmgr->variant == QCOM_BATTMGR_X1E80100)
 		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
 	else
 		qcom_battmgr_sm8350_callback(battmgr, data, len);
+
+	battmgr->request_pending = false;
+	complete(&battmgr->ack);
 }
 
 static void qcom_battmgr_enable_worker(struct work_struct *work)
@@ -2388,20 +2731,33 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
-	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
-	if (ret)
+	scoped_guard(mutex, &battmgr->lock)
+		ret = qcom_battmgr_request(battmgr, &req, sizeof(req), BATTMGR_NO_PROPERTY);
+	if (ret && ret != -ENODEV && ret != -EAGAIN && ret != -ECONNRESET)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+	qcom_battmgr_xiaomi_schedule_charge_ctrl(battmgr);
 }
 
 static void qcom_battmgr_pdr_notify(void *priv, int state)
 {
 	struct qcom_battmgr *battmgr = priv;
+	bool up = state == SERVREG_SERVICE_STATE_UP;
 
-	if (state == SERVREG_SERVICE_STATE_UP) {
-		battmgr->service_up = true;
+	guard(spinlock_irqsave)(&battmgr->response_lock);
+	if (battmgr->service_up == up)
+		return;
+
+	WRITE_ONCE(battmgr->service_generation, battmgr->service_generation + 1);
+	WRITE_ONCE(battmgr->service_up, up);
+	if (up) {
 		schedule_work(&battmgr->enable_work);
-	} else {
-		battmgr->service_up = false;
+	} else if (battmgr->request_pending) {
+		if (qcom_battmgr_is_inhibit_read(battmgr->request_opcode,
+						battmgr->request_property))
+			battmgr->stale_inhibit_read = true;
+		battmgr->error = -ECONNRESET;
+		battmgr->request_pending = false;
+		complete(&battmgr->ack);
 	}
 }
 
@@ -2446,6 +2802,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.num_supplicants = 1;
 
 	mutex_init(&battmgr->lock);
+	spin_lock_init(&battmgr->response_lock);
 	init_completion(&battmgr->ack);
 
 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
@@ -2454,10 +2811,21 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	else
 		battmgr->variant = QCOM_BATTMGR_SM8350;
 
-	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
-	if (ret < 0)
-		return dev_err_probe(dev, ret,
-				     "failed to init battery charge control thresholds\n");
+	battmgr->xiaomi_charge_ctrl = battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
+				     of_machine_is_compatible("xiaomi,sheng");
+	if (battmgr->xiaomi_charge_ctrl) {
+		mutex_init(&battmgr->charge_ctrl_lock);
+		INIT_DELAYED_WORK(&battmgr->charge_ctrl_work, qcom_battmgr_xiaomi_charge_ctrl_work);
+		battmgr->charge_ctrl_start = CHARGE_CTRL_START_THR_MAX;
+		battmgr->charge_ctrl_end = CHARGE_CTRL_END_THR_MAX;
+		battmgr->charge_inhibit = QCOM_BATTMGR_INHIBIT_UNKNOWN;
+		battmgr->charge_ctrl_next_notification = jiffies;
+	} else {
+		ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
+		if (ret < 0)
+			return dev_err_probe(dev, ret,
+					     "failed to init battery charge control thresholds\n");
+	}
 
 	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
 		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_attr_group);
@@ -2540,6 +2908,28 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	return 0;
 }
 
+static void qcom_battmgr_stop(struct auxiliary_device *adev)
+{
+	struct qcom_battmgr *battmgr = auxiliary_get_drvdata(adev);
+
+	if (battmgr->xiaomi_charge_ctrl)
+		qcom_battmgr_xiaomi_cleanup_charge_ctrl(battmgr);
+
+	/* Drain requests before devres can free the GLINK client. */
+	scoped_guard(mutex, &battmgr->lock)
+		battmgr->stopping = true;
+	disable_work_sync(&battmgr->enable_work);
+}
+
+static int qcom_battmgr_resume(struct device *dev)
+{
+	qcom_battmgr_xiaomi_schedule_charge_ctrl(dev_get_drvdata(dev));
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(qcom_battmgr_pm_ops, NULL, qcom_battmgr_resume);
+
 static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
 	{ .name = "pmic_glink.power-supply", },
 	{},
@@ -2549,6 +2939,9 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
 static struct auxiliary_driver qcom_battmgr_driver = {
 	.name = "pmic_glink_power_supply",
 	.probe = qcom_battmgr_probe,
+	.remove = qcom_battmgr_stop,
+	.shutdown = qcom_battmgr_stop,
+	.driver.pm = pm_sleep_ptr(&qcom_battmgr_pm_ops),
 	.id_table = qcom_battmgr_id_table,
 };
 
