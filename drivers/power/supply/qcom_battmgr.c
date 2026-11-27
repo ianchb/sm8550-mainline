@@ -399,6 +399,7 @@ struct qcom_battmgr {
 	struct completion ack;
 
 	bool service_up;
+	bool stopping;
 
 	struct qcom_battmgr_info info;
 	struct qcom_battmgr_status status;
@@ -429,6 +430,10 @@ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t
 {
 	unsigned long left;
 	int ret;
+
+	lockdep_assert_held(&battmgr->lock);
+	if (battmgr->stopping)
+		return -ENODEV;
 
 	reinit_completion(&battmgr->ack);
 
@@ -2388,8 +2393,9 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
-	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
-	if (ret)
+	scoped_guard(mutex, &battmgr->lock)
+		ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+	if (ret && ret != -ENODEV)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
 }
 
@@ -2540,6 +2546,16 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	return 0;
 }
 
+static void qcom_battmgr_stop(struct auxiliary_device *adev)
+{
+	struct qcom_battmgr *battmgr = auxiliary_get_drvdata(adev);
+
+	/* Drain requests before devres can free the GLINK client. */
+	scoped_guard(mutex, &battmgr->lock)
+		battmgr->stopping = true;
+	disable_work_sync(&battmgr->enable_work);
+}
+
 static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
 	{ .name = "pmic_glink.power-supply", },
 	{},
@@ -2549,6 +2565,7 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
 static struct auxiliary_driver qcom_battmgr_driver = {
 	.name = "pmic_glink_power_supply",
 	.probe = qcom_battmgr_probe,
+	.remove = qcom_battmgr_stop,
 	.id_table = qcom_battmgr_id_table,
 };
 
